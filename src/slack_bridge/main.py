@@ -444,10 +444,12 @@ def main():
     @app.event("message")
     def on_message(event, logger):
         if event.get("bot_id") or event.get("subtype"):
+            print(f"[message] skipped (bot_id or subtype): {event.get('subtype')}")
             return
         user = event.get("user")
         channel = event.get("channel")
         text = (event.get("text") or "").strip()
+        print(f"[message] from {user} in {channel}: {text!r}")
         if not user or not channel or not text:
             return
         threading.Thread(
@@ -460,15 +462,24 @@ def main():
     def on_mention(event, logger):
         user = event.get("user")
         channel = event.get("channel")
-        text = (event.get("text") or "").strip()
-        text = re.sub(r"^<@[A-Z0-9]+>\s*", "", text)
+        raw = (event.get("text") or "").strip()
+        # Strip leading bot mention. Slack may use <@U123>, <@U123|name>, or
+        # occasionally lowercase IDs — match permissively.
+        text = re.sub(r"^<@[\w]+(\|[^>]+)?>\s*", "", raw)
+        print(f"[app_mention] from {user} in {channel}: raw={raw!r} stripped={text!r}")
         if not user or not channel or not text:
+            print("[app_mention] dropped: missing user/channel/text")
             return
         threading.Thread(
             target=handle,
             args=(user, channel, text, event.get("thread_ts")),
             daemon=True,
         ).start()
+
+    # Catch-all so we see *any* event Slack sends us — useful when nothing fires.
+    @app.event({"type": "message", "subtype": "message_changed"})
+    def _noop_edit(event, logger):
+        pass
 
     threading.Thread(target=cleanup_idle_loop, daemon=True).start()
     print("Slack bridge running. DM your bot or @mention it in a channel.")
