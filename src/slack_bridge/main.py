@@ -208,13 +208,23 @@ def start_named_session(cli, name, path, inviter_user, app):
     app.client.conversations_invite(channel=channel_id, users=inviter_user)
 
     tmux_name = f"slack_named_{channel_id}_{cli}".replace(".", "_")
-    if not start_session(cli, tmux_name, cwd=path):
+    # 90s instead of 30s — snap apps (gemini, codex) can be slow to start under
+    # memory/CPU pressure. If we timeout, capture the pane to help diagnose.
+    if not start_session(cli, tmux_name, cwd=path, max_wait=90):
+        try:
+            tail = capture(tmux_name)[-600:] or "(empty)"
+        except Exception:
+            tail = "(capture failed)"
         kill_session(tmux_name)
         try:
             app.client.conversations_archive(channel=channel_id)
         except SlackApiError:
             pass
-        raise RuntimeError(f"`{cli}` didn't reach prompt within 30s in `{path}`")
+        raise RuntimeError(
+            f"`{cli}` didn't reach prompt within 90s in `{path}`. "
+            f"This usually means the system is under heavy load.\n"
+            f"Last pane content:\n```\n{tail}\n```"
+        )
 
     return channel_id, tmux_name, final_name
 
