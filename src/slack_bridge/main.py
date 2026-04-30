@@ -145,6 +145,9 @@ class CLISession:
     path: Optional[str] = None
     slack_channel_id: Optional[str] = None
     is_named: bool = False  # True when this session owns its dedicated Slack channel
+    # Lock taken while a message is being typed/processed for this session.
+    # Prevents two concurrent Slack messages from interleaving keystrokes.
+    io_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 # Keyed by Slack channel_id. DM channels are unique per user, so this also
@@ -626,13 +629,14 @@ def make_handler(app):
 
         placeholder = post(channel, ":hourglass_flowing_sand: Thinking…", thread_ts)
         ts = placeholder["ts"]
-        try:
-            response = send_and_wait(sess.tmux_name, text, sess.cli)
-        except Exception as e:
-            update(channel, ts, f":warning: Error: `{e}`")
-            return
-
-        with sessions_lock:
+        # Per-session lock prevents two concurrent Slack messages from typing into
+        # the same tmux session in parallel and stomping each other's keystrokes.
+        with sess.io_lock:
+            try:
+                response = send_and_wait(sess.tmux_name, text, sess.cli)
+            except Exception as e:
+                update(channel, ts, f":warning: Error: `{e}`")
+                return
             sess.last_used = time.time()
 
         update(channel, ts, _format_for_slack(response))
