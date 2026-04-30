@@ -23,14 +23,17 @@ im:write. Subscribe to events: message.im, app_mention.
 import importlib.util
 import os
 import re
+import secrets
 import sys
 import time
 import threading
 import subprocess
 from dataclasses import dataclass, field
+from typing import Optional
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_sdk.errors import SlackApiError
 
 
 def _load_check_limit():
@@ -118,24 +121,85 @@ class CLISession:
     cli: str
     tmux_name: str
     last_used: float = field(default_factory=time.time)
+    path: Optional[str] = None
+    slack_channel_id: Optional[str] = None
+    is_named: bool = False  # True when this session owns its dedicated Slack channel
 
 
+# Keyed by Slack channel_id. DM channels are unique per user, so this also
+# uniquely identifies per-user DM sessions; named sessions live in their own channel.
 sessions: dict = {}
 sessions_lock = threading.Lock()
 IDLE_TIMEOUT_SEC = 30 * 60
 
 
-def start_session(cli, name, max_wait=30):
+def start_session(cli, name, max_wait=30, cwd=None):
     cfg = CLI_CONFIGS[cli]
     if session_exists(name):
         _tmux("kill-session", "-t", name)
-    _tmux("new-session", "-d", "-s", name, "-x", "200", "-y", "50", cfg["cmd"])
+    args = ["new-session", "-d", "-s", name, "-x", "200", "-y", "50"]
+    if cwd:
+        args += ["-c", cwd]
+    args.append(cfg["cmd"])
+    _tmux(*args)
     deadline = time.time() + max_wait
     while time.time() < deadline:
         if cfg["ready_marker"] in capture(name):
             return True
         time.sleep(0.5)
     return False
+
+
+def _slugify_channel(name):
+    """Slack channel names: lowercase, [a-z0-9_-], <=80 chars."""
+    s = re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-_")[:70]
+    return s or "session"
+
+
+def start_named_session(cli, name, path, inviter_user, app):
+    """Create channel `agent-<slug>`, invite inviter, launch tmux with cwd=path.
+
+    Returns (channel_id, tmux_name, channel_name) on success.
+    Raises ValueError on bad path. Raises SlackApiError or RuntimeError on Slack/CLI failures.
+    """
+    if not os.path.isdir(path):
+        raise ValueError(f"path not found or not a directory: `{path}`")
+
+    slug = _slugify_channel(name)
+    base_name = f"agent-{slug}"
+
+    # Try create as private; on name collision, append a short random suffix.
+    channel_id = None
+    final_name = base_name
+    last_err = None
+    for attempt in range(3):
+        try_name = base_name if attempt == 0 else f"{base_name}-{secrets.token_hex(2)}"
+        try:
+            resp = app.client.conversations_create(name=try_name, is_private=True)
+            channel_id = resp["channel"]["id"]
+            final_name = try_name
+            break
+        except SlackApiError as e:
+            err = e.response.get("error", "")
+            last_err = e
+            if err == "name_taken":
+                continue
+            raise
+    if channel_id is None:
+        raise last_err or RuntimeError("could not create channel")
+
+    app.client.conversations_invite(channel=channel_id, users=inviter_user)
+
+    tmux_name = f"slack_named_{channel_id}_{cli}".replace(".", "_")
+    if not start_session(cli, tmux_name, cwd=path):
+        kill_session(tmux_name)
+        try:
+            app.client.conversations_archive(channel=channel_id)
+        except SlackApiError:
+            pass
+        raise RuntimeError(f"`{cli}` didn't reach prompt within 30s in `{path}`")
+
+    return channel_id, tmux_name, final_name
 
 
 def kill_session(name):
@@ -216,15 +280,22 @@ def send_and_wait(name, user_text, cli, max_wait=180, stable_secs=3.5, poll=1.0)
     return cleaned
 
 
-def cleanup_idle_loop():
+def cleanup_idle_loop(app=None):
+    """Periodically kill tmux sessions that have been idle past the timeout.
+    For named sessions (with their own Slack channel), archive the channel too."""
     while True:
         time.sleep(60)
         now = time.time()
         with sessions_lock:
-            stale = [k for k, s in sessions.items() if now - s.last_used > IDLE_TIMEOUT_SEC]
-            for k in stale:
-                kill_session(sessions[k].tmux_name)
-                del sessions[k]
+            stale_keys = [k for k, s in sessions.items() if now - s.last_used > IDLE_TIMEOUT_SEC]
+            stale_sessions = [(k, sessions.pop(k)) for k in stale_keys]
+        for _k, sess in stale_sessions:
+            kill_session(sess.tmux_name)
+            if app and sess.is_named and sess.slack_channel_id:
+                try:
+                    app.client.conversations_archive(channel=sess.slack_channel_id)
+                except SlackApiError as e:
+                    print(f"[idle-archive] failed: {e.response.get('error')}")
 
 
 # ---- check_limit integration -------------------------------------------------
@@ -377,40 +448,80 @@ def make_handler(app):
         return app.client.chat_update(**kwargs)
 
     def handle(user, channel, text, thread_ts):
-        key = (user, channel)
         cmd = text.split()[0].lower() if text else ""
 
         if cmd in ("!gemini", "!codex", "!claude"):
             cli = cmd[1:]
+            parts = text.split(maxsplit=2)
+            # Two-arg form: !<cli> <name> <path> → dedicated channel + cwd
+            if len(parts) >= 3:
+                sess_name, sess_path = parts[1], parts[2]
+                try:
+                    ch_id, tmux_name, ch_name = start_named_session(
+                        cli, sess_name, sess_path, user, app)
+                except ValueError as e:
+                    post(channel, f":warning: {e}", thread_ts); return
+                except SlackApiError as e:
+                    err = e.response.get("error", "")
+                    if err == "missing_scope":
+                        needed = e.response.get("needed", "groups:write")
+                        post(channel,
+                             f":warning: Slack app is missing scope `{needed}`. "
+                             "Add it to the Slack app config and reinstall, then retry.",
+                             thread_ts)
+                    else:
+                        post(channel, f":warning: Slack error: `{err}`", thread_ts)
+                    return
+                except Exception as e:
+                    post(channel, f":warning: {e}", thread_ts); return
+                with sessions_lock:
+                    sessions[ch_id] = CLISession(
+                        cli=cli, tmux_name=tmux_name, path=sess_path,
+                        slack_channel_id=ch_id, is_named=True)
+                post(channel,
+                     f":zap: Created <#{ch_id}|{ch_name}>, invited you, and launched `{cli}` in `{sess_path}`.",
+                     thread_ts)
+                post(ch_id,
+                     f":zap: `{cli}` ready (cwd `{sess_path}`). Send any message. `!end` to stop and archive this channel.",
+                     None)
+                return
+            # Existing one-channel-per-DM form.
             with sessions_lock:
-                if key in sessions:
-                    kill_session(sessions[key].tmux_name)
+                if channel in sessions:
+                    kill_session(sessions[channel].tmux_name)
                 tmux_name = f"slack_{user}_{channel}_{cli}".replace(".", "_")
                 ok = start_session(cli, tmux_name)
                 if not ok:
                     post(channel, f":warning: Failed to start `{cli}` — prompt didn't appear within 30s.", thread_ts)
                     return
-                sessions[key] = CLISession(cli=cli, tmux_name=tmux_name)
+                sessions[channel] = CLISession(cli=cli, tmux_name=tmux_name)
             post(channel, f":zap: Started `{cli}` session. Send any message to chat. `!end` to stop, `!reset` to restart.", thread_ts)
             return
 
         if cmd == "!end":
             with sessions_lock:
-                if key in sessions:
-                    kill_session(sessions[key].tmux_name)
-                    del sessions[key]
-                    post(channel, ":wave: Session ended.", thread_ts)
-                else:
-                    post(channel, "No active session.", thread_ts)
+                sess = sessions.pop(channel, None)
+            if not sess:
+                post(channel, "No active session.", thread_ts)
+                return
+            kill_session(sess.tmux_name)
+            if sess.is_named and sess.slack_channel_id:
+                post(sess.slack_channel_id, ":wave: Session ended. Archiving this channel.", None)
+                try:
+                    app.client.conversations_archive(channel=sess.slack_channel_id)
+                except SlackApiError as e:
+                    print(f"[archive] failed: {e.response.get('error')}")
+            else:
+                post(channel, ":wave: Session ended.", thread_ts)
             return
 
         if cmd == "!reset":
             with sessions_lock:
-                sess = sessions.get(key)
+                sess = sessions.get(channel)
                 cli = sess.cli if sess else None
                 if sess:
                     kill_session(sess.tmux_name)
-                    del sessions[key]
+                    del sessions[channel]
             if not cli:
                 post(channel, "No active session to reset. Try `!gemini` or `!codex`.", thread_ts)
                 return
@@ -430,10 +541,12 @@ def make_handler(app):
 
         if cmd == "!status":
             with sessions_lock:
-                sess = sessions.get(key)
+                sess = sessions.get(channel)
             if sess:
                 age = int(time.time() - sess.last_used)
-                post(channel, f":eyes: Active `{sess.cli}` session (idle {age}s, tmux `{sess.tmux_name}`).", thread_ts)
+                tag = " (named)" if sess.is_named else ""
+                cwd = f", cwd `{sess.path}`" if sess.path else ""
+                post(channel, f":eyes: Active `{sess.cli}` session{tag} (idle {age}s, tmux `{sess.tmux_name}`{cwd}).", thread_ts)
             else:
                 post(channel, "No active session. Try `!gemini` or `!codex` first.", thread_ts)
             return
@@ -441,19 +554,19 @@ def make_handler(app):
         if cmd in ("!help", "help"):
             post(channel,
                  "*Commands*\n"
-                 "`!gemini` start Gemini session\n"
-                 "`!codex` start Codex session\n"
-                 "`!claude` start Claude session\n"
-                 "`!check_limit` show usage limits for all CLIs\n"
-                 "`!status` show active session\n"
-                 "`!reset` restart current session\n"
-                 "`!end` stop current session\n"
+                 "`!gemini` / `!codex` / `!claude` — start session in this channel\n"
+                 "`!gemini <name> <path>` — create a dedicated channel + run CLI from `<path>`\n"
+                 "  (also works with `!codex` / `!claude`)\n"
+                 "`!check_limit` — show usage limits for all CLIs\n"
+                 "`!status` — show active session\n"
+                 "`!reset` — restart current session\n"
+                 "`!end` — stop current session (archives the channel if it was named)\n"
                  "Anything else is forwarded to the active CLI.",
                  thread_ts)
             return
 
         with sessions_lock:
-            sess = sessions.get(key)
+            sess = sessions.get(channel)
         if not sess:
             post(channel, "No active session. Start one with `!gemini`, `!codex`, or `!claude`.", thread_ts)
             return
@@ -545,7 +658,7 @@ def main():
     def _noop_edit(event, logger):
         pass
 
-    threading.Thread(target=cleanup_idle_loop, daemon=True).start()
+    threading.Thread(target=cleanup_idle_loop, args=(app,), daemon=True).start()
     print("Slack bridge running. DM your bot or @mention it in a channel.")
     SocketModeHandler(app, app_token).start()
 
