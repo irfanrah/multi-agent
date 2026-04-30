@@ -18,21 +18,43 @@ from main import (  # noqa: E402
     parse_codex_rows,
 )
 
+# Expected minimum row counts — used to decide when polling is "done" so we
+# don't return on a partially rendered panel.
 CLIS = [
-    ("Claude", {"cmd": "claude /usage", "parser": parse_claude_rows}),
-    ("Gemini", {"cmd": "gemini /model", "parser": parse_gemini_rows}),
-    ("Codex",  {"cmd": "codex", "send_keys": "/status", "post_wait": 10, "parser": parse_codex_rows}),
+    ("Claude", {
+        "cmd": "claude /usage",
+        "parser": parse_claude_rows,
+        "expected": 3,  # session, week-all, week-sonnet
+    }),
+    ("Gemini", {
+        "cmd": "gemini /model",
+        "parser": parse_gemini_rows,
+        "expected": 3,  # Flash, Flash Lite, Pro
+    }),
+    ("Codex", {
+        "cmd": "codex",
+        "send_keys": "/status",
+        # Codex's TUI shows '›' once it's ready to accept input.
+        "prompt_ready": lambda t: "›" in t,
+        "parser": parse_codex_rows,
+        "expected": 2,  # 5h, weekly
+    }),
 ]
 REFRESH_MS = 60_000
+MAX_WAIT_SEC = 45
 
 
 def _capture_one(name, opts):
+    parser = opts["parser"]
+    expected = opts.get("expected", 1)
     raw = capture_cli_usage(
         opts["cmd"], f"widget_{name.lower()}",
         send_keys=opts.get("send_keys"),
-        post_wait=opts.get("post_wait", 4),
+        prompt_ready=opts.get("prompt_ready"),
+        ready_check=lambda t: len(parser(t)) >= expected,
+        max_wait=MAX_WAIT_SEC,
     )
-    return name, opts["parser"](raw)
+    return name, parser(raw)
 
 
 def fetch_all_parallel():
@@ -132,8 +154,8 @@ class UsageWidget(tk.Tk):
         ).pack(anchor="w")
         if not rows:
             tk.Label(
-                section, text="(no data)", bg=self.BG, fg=self.SUB,
-                font=("Ubuntu", 9, "italic"),
+                section, text="(no data — CLI didn't render in time)",
+                bg=self.BG, fg=self.CRIT, font=("Ubuntu", 9, "italic"),
             ).pack(anchor="w", pady=(2, 0))
             return
         for r in rows:

@@ -8,29 +8,56 @@ BOX_CHARS = r"[│╭╯╰╮─█░▝▘▛▜▟▞▖▗▎▏▬·]"
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUTPUT_DIR = os.path.join(REPO_ROOT, "output", "check_limit")
 
-def capture_cli_usage(command, session_name="usage_check", send_keys=None, startup_wait=10, post_wait=4):
+def capture_cli_usage(command, session_name="usage_check", send_keys=None,
+                      startup_wait=10, post_wait=4, *,
+                      ready_check=None, prompt_ready=None,
+                      max_wait=40, poll=1.0, send_settle=1.5):
     """Run a command in tmux, optionally type a slash command, capture the UI, kill the session.
 
-    `send_keys` is used for CLIs (like Codex) where slash commands only work
-    interactively — passing them as CLI args sends them to the model as a prompt.
-    The text and Enter are sent in two separate calls with a small gap so any
-    autocomplete dropdown has time to settle before submission.
+    Two modes:
+    - Legacy (fixed sleeps): if `ready_check` is None, sleep `startup_wait`, optionally
+      send_keys, sleep `post_wait`, capture once.
+    - Polling: if `ready_check(text) -> bool` is provided, poll capture every `poll`
+      seconds until ready_check returns True or `max_wait` elapses. If `prompt_ready`
+      is provided alongside `send_keys`, wait for prompt_ready(text) to be True before
+      typing — handy for TUIs that need a moment before accepting input.
+
+    Polling is more robust against slow startups (update banners, MOTDs, login checks).
     """
     try:
         subprocess.run(["tmux", "kill-session", "-t", session_name], stderr=subprocess.DEVNULL)
         subprocess.run(["tmux", "new-session", "-d", "-s", session_name, "-x", "200", "-y", "50", command])
-        time.sleep(startup_wait)
-        if send_keys:
-            # Use -l so text is sent literally (no key-name interpretation).
-            subprocess.run(["tmux", "send-keys", "-t", session_name, "-l", send_keys])
-            time.sleep(1.5)
-            subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"])
-            time.sleep(post_wait)
-        result = subprocess.check_output(["tmux", "capture-pane", "-pt", session_name], text=True)
-        subprocess.run(["tmux", "kill-session", "-t", session_name])
-        return result
+
+        if ready_check is None:
+            # Legacy fixed-time path.
+            time.sleep(startup_wait)
+            if send_keys:
+                subprocess.run(["tmux", "send-keys", "-t", session_name, "-l", send_keys])
+                time.sleep(send_settle)
+                subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"])
+                time.sleep(post_wait)
+            return subprocess.check_output(["tmux", "capture-pane", "-pt", session_name], text=True)
+
+        # Polling path.
+        sent = (send_keys is None)
+        start = time.time()
+        text = ""
+        while time.time() - start < max_wait:
+            text = subprocess.check_output(["tmux", "capture-pane", "-pt", session_name], text=True)
+            if not sent:
+                if prompt_ready is None or prompt_ready(text):
+                    subprocess.run(["tmux", "send-keys", "-t", session_name, "-l", send_keys])
+                    time.sleep(send_settle)
+                    subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"])
+                    sent = True
+            elif ready_check(text):
+                return text
+            time.sleep(poll)
+        return text
     except Exception as e:
         return f"Error: {e}"
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", session_name], stderr=subprocess.DEVNULL)
 
 def _clean(line):
     return re.sub(r"\s+", " ", re.sub(BOX_CHARS, " ", line)).strip()
