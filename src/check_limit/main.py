@@ -35,12 +35,12 @@ def capture_cli_usage(command, session_name="usage_check", send_keys=None, start
 def _clean(line):
     return re.sub(r"\s+", " ", re.sub(BOX_CHARS, " ", line)).strip()
 
-def parse_claude(text):
-    """Claude /usage: label line, then bar + N% used, then 'Resets ...'."""
+def parse_claude_rows(text):
+    """Claude /usage: label line, then bar + N% used, then 'Resets ...'.
+    Returns [{"label": str, "pct_used": int, "reset": str|None}, ...]."""
     lines = [_clean(l) for l in text.split("\n")]
     labels = {"Current session", "Current week (all models)", "Current week (Sonnet only)"}
-    results = []
-    current = None
+    rows, current = [], None
     for i, line in enumerate(lines):
         if line in labels:
             current = line
@@ -48,46 +48,42 @@ def parse_claude(text):
         m = re.search(r"(\d+)%\s*used", line)
         if m and current:
             pct = int(m.group(1))
-            reset = ""
+            reset = None
             if i + 1 < len(lines):
                 rm = re.match(r"Resets\s+(.+)", lines[i + 1])
                 if rm:
-                    reset = f" (resets {rm.group(1).strip()})"
-            results.append(f"{current}: {pct}% used{reset}")
+                    reset = rm.group(1).strip()
+            rows.append({"label": current, "pct_used": pct, "reset": reset})
             current = None
-    return " | ".join(results) if results else "Usage not found"
+    return rows
 
-def parse_gemini(text):
+def parse_gemini_rows(text):
     """Gemini /model: 'Flash <bar> 24% Resets: 2:49 PM (21h 29m)'."""
-    results = []
+    rows = []
     for line in text.split("\n"):
         c = _clean(line)
         m = re.match(r"^(Flash Lite|Flash|Pro)\s+(\d+)%(?:\s*Resets?:?\s*(.+))?$", c)
         if m:
-            label, pct, reset = m.group(1), m.group(2), m.group(3)
-            entry = f"{label}: {pct}% used"
-            if reset:
-                entry += f" (resets {reset.strip()})"
-            results.append(entry)
-    return " | ".join(results) if results else "Usage not found"
+            rows.append({
+                "label": m.group(1),
+                "pct_used": int(m.group(2)),
+                "reset": m.group(3).strip() if m.group(3) else None,
+            })
+    return rows
 
-def parse_codex(text):
+def parse_codex_rows(text):
     """Codex /status panel: '5h limit: [bar] 49% left (resets 19:28)' etc."""
-    results = []
+    rows = []
     for line in text.split("\n"):
         c = _clean(line)
-        # Match labelled limits: "5h limit: [bar] 49% left (resets 19:28)" — bar leaves "[ ]" after _clean strips █/░.
         m = re.match(r"^([A-Za-z0-9][A-Za-z0-9 ]*?limit):.*?(\d+)%\s*(used|left)\s*(?:\(resets?\s+([^)]+)\))?",
                      c, re.IGNORECASE)
         if m:
             label, val, kind, reset = m.group(1).strip(), int(m.group(2)), m.group(3).lower(), m.group(4)
             used = 100 - val if kind == "left" else val
-            entry = f"{label}: {used}% used ({100 - used}% left)"
-            if reset:
-                entry += f" (resets {reset.strip()})"
-            results.append(entry)
-    if results:
-        return " | ".join(results)
+            rows.append({"label": label, "pct_used": used, "reset": reset.strip() if reset else None})
+    if rows:
+        return rows
     # Fallback: footer-only line "gpt-5.4 default · 100% left · /path" (· stripped to space).
     for line in text.split("\n"):
         c = _clean(line)
@@ -95,10 +91,26 @@ def parse_codex(text):
         if m:
             model, plan, val, kind = m.group(1), m.group(2), int(m.group(3)), m.group(4).lower()
             used = 100 - val if kind == "left" else val
-            return f"{model} ({plan}): {used}% used ({100 - used}% left)"
-    return "Usage not found"
+            return [{"label": f"{model} ({plan})", "pct_used": used, "reset": None}]
+    return []
+
+def format_rows(rows):
+    if not rows:
+        return "Usage not found"
+    parts = []
+    for r in rows:
+        s = f"{r['label']}: {r['pct_used']}% used"
+        if r.get("reset"):
+            s += f" (resets {r['reset']})"
+        parts.append(s)
+    return " | ".join(parts)
+
+def parse_claude(text): return format_rows(parse_claude_rows(text))
+def parse_gemini(text): return format_rows(parse_gemini_rows(text))
+def parse_codex(text):  return format_rows(parse_codex_rows(text))
 
 PARSERS = {"Claude": parse_claude, "Gemini": parse_gemini, "Codex": parse_codex}
+ROW_PARSERS = {"Claude": parse_claude_rows, "Gemini": parse_gemini_rows, "Codex": parse_codex_rows}
 
 if __name__ == "__main__":
     os.makedirs(OUTPUT_DIR, exist_ok=True)
