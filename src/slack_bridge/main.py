@@ -112,15 +112,17 @@ CLI_CONFIGS = {
     # `assistant_marker`: prefix the CLI uses for assistant turns in the conversation log.
     # `cmd`: launched via tmux; flags are tuned so the CLI doesn't sit on permission prompts
     # (which the bridge can't answer) and so output stays in scrollback (no alt-screen).
+    # `trust_pattern` + `trust_keys`: substring to detect first-launch folder-trust dialog
+    # and the keystrokes to send to accept it. start_session auto-handles this so users
+    # don't have to manually trust each new project folder.
     "gemini": {
         "cmd": "gemini",
         "ready_marker": "Type your message",
         "assistant_marker": "✦",
+        "trust_pattern": "Do you trust the files in this folder",
+        "trust_keys": "1",  # "1. Trust folder"
     },
     "codex": {
-        # --no-alt-screen: inline TUI so tmux capture-pane sees full scrollback.
-        # -s workspace-write: sandbox writes to cwd. Keep default approval policy
-        # so prompts get forwarded to Slack and the user answers there.
         "cmd": "codex --no-alt-screen -s workspace-write",
         "ready_marker": "›",
         "assistant_marker": "•",
@@ -129,6 +131,8 @@ CLI_CONFIGS = {
         "cmd": "claude",
         "ready_marker": "? for shortcuts",
         "assistant_marker": "●",
+        "trust_pattern": "Yes, I trust this folder",
+        "trust_keys": "1",  # "1. Yes, I trust this folder"
     },
 }
 
@@ -159,10 +163,22 @@ def start_session(cli, name, max_wait=30, cwd=None):
         args += ["-c", cwd]
     args.append(cfg["cmd"])
     _tmux(*args)
+
+    trust_pattern = cfg.get("trust_pattern")
+    trust_keys = cfg.get("trust_keys")
+    trust_handled = False
+
     deadline = time.time() + max_wait
     while time.time() < deadline:
-        if cfg["ready_marker"] in capture(name):
+        text = capture(name)
+        if cfg["ready_marker"] in text:
             return True
+        # First-launch folder-trust dialog: dismiss it once.
+        if not trust_handled and trust_pattern and trust_pattern in text:
+            _tmux("send-keys", "-t", name, "-l", trust_keys)
+            time.sleep(0.3)
+            _tmux("send-keys", "-t", name, "Enter")
+            trust_handled = True
         time.sleep(0.5)
     return False
 
