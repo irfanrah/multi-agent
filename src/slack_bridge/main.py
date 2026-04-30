@@ -230,7 +230,8 @@ def cleanup_idle_loop():
 # ---- check_limit integration -------------------------------------------------
 
 def run_check_limit():
-    """Run the three usage captures in parallel and return a Slack-formatted summary."""
+    """Run the three usage captures in parallel; retry any CLI that didn't return
+    enough rows. Returns (text_fallback, blocks)."""
     global _check_limit
     if _check_limit is None:
         _check_limit = _load_check_limit()
@@ -241,29 +242,48 @@ def run_check_limit():
         ("Gemini", "gemini /model", cl.parse_gemini_rows, 3, None, None),
         ("Codex",  "codex",         cl.parse_codex_rows,  2, "/status", lambda t: "›" in t),
     ]
+
+    def fetch(name, cmd, parser, expected, send_keys, prompt_ready, suffix="", max_wait=30):
+        raw = cl.capture_cli_usage(
+            cmd, f"slack_chk_{name.lower()}{suffix}",
+            send_keys=send_keys,
+            prompt_ready=prompt_ready,
+            ready_check=lambda t: len(parser(t)) >= expected,
+            max_wait=max_wait,
+        )
+        return parser(raw)
+
     results = {}
     lock = threading.Lock()
 
-    def worker(name, cmd, parser, expected, send_keys, prompt_ready):
+    def worker(t):
+        name = t[0]
         try:
-            raw = cl.capture_cli_usage(
-                cmd, f"slack_chk_{name.lower()}",
-                send_keys=send_keys,
-                prompt_ready=prompt_ready,
-                ready_check=lambda t: len(parser(t)) >= expected,
-                max_wait=45,
-            )
-            with lock:
-                results[name] = parser(raw)
+            rows = fetch(*t)
         except Exception as e:
-            with lock:
-                results[name] = [{"label": f"error: {e}", "pct_used": -1, "reset": None}]
+            print(f"[check_limit] {name} parallel error: {e}")
+            rows = []
+        with lock:
+            results[name] = rows
 
-    threads = [threading.Thread(target=worker, args=t, daemon=True) for t in targets]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    # First pass: parallel.
+    threads = [threading.Thread(target=worker, args=(t,), daemon=True) for t in targets]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    # Retry pass: any CLI that came back short of expected.
+    for t in targets:
+        name, _cmd, _parser, expected = t[0], t[1], t[2], t[3]
+        if len(results.get(name, [])) < expected:
+            print(f"[check_limit] {name} returned {len(results.get(name, []))}/{expected} rows, retrying sequentially")
+            try:
+                rows = fetch(*t, suffix="_retry", max_wait=20)
+                if rows:
+                    results[name] = rows
+            except Exception as e:
+                print(f"[check_limit] {name} retry error: {e}")
 
     return format_check_limit(results)
 
