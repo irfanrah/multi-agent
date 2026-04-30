@@ -69,6 +69,7 @@ NOISE_LINE_RE = re.compile(
     r"^\s*✻\s+\w+\s+for\s+\d+s\s*$"
     r"|^\s*⎿\s+(?:Running|Streaming|Loading|Waiting)…?\s*$"
     r"|^\s*\(?(?:Press\s+)?[Ee]sc\s+to\s+(?:interrupt|cancel|exit).*$"
+    r"|^\s*Press\s+enter\s+to\s+confirm\b.*$"
 )
 # Strip leading assistant marker so each Claude tool-call line reads naturally.
 LEADING_MARKER_RE = re.compile(r"^([●•✦])\s+")
@@ -308,7 +309,7 @@ CHROME_DIVIDER_RE = re.compile(
     r"|^▄{3,}\s*$"                       # Gemini box top
     r"|^▀{3,}\s*$"                       # Gemini box bottom
     r"|^\s*Shift\+Tab to accept edits\s*$"
-    r"|^\s*›\s"                          # Codex input prompt (next placeholder)
+    r"|^.*\d+%\s+left\b.*$"              # Codex footer: "gpt-X · N% left · /path"
     r"|^\s*❯\s*$",                       # Claude empty input prompt
     re.MULTILINE,
 )
@@ -318,15 +319,18 @@ CHROME_DIVIDER_RE = re.compile(
 # user can read it in Slack and reply with their choice.
 PERMISSION_DIALOG_RE = re.compile(
     r"Do you want to proceed\?"
+    r"|Would you like to run"
     r"|Allow this (?:action|command|tool)"
-    r"|❯\s*\d+\.\s*(?:Yes|Allow|Trust|Approve)"
-    r"|\[\s*y\s*/\s*n\s*\]"
-    r"|\[\s*Y\s*/\s*n\s*\]"
-    r"|\[\s*y\s*/\s*N\s*\]",
+    r"|[›❯]\s*\d+\.\s*(?:Yes|Allow|Trust|Approve)"
+    r"|\[\s*[yY]\s*/\s*[nN]\s*\]",
     re.IGNORECASE,
 )
-# End-of-dialog footer to clip at, so we don't include the post-dialog chrome.
-DIALOG_END_RE = re.compile(r"^\s*Esc to cancel\b.*$", re.MULTILINE)
+# End-of-dialog footer markers to clip at, so we don't include post-dialog chrome.
+DIALOG_END_RE = re.compile(
+    r"^\s*Esc to cancel\b.*$"
+    r"|^\s*Press enter to confirm\b.*$",
+    re.MULTILINE,
+)
 THINKING_RE = re.compile(r"⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏")
 
 
@@ -381,12 +385,24 @@ def send_and_wait(name, user_text, cli, max_wait=180, response_stable_secs=3.5,
 
     post = capture(name)
     post_no_ansi = ANSI_RE.sub("", post)
+    post_marker_count = post_no_ansi.count(marker)
 
-    # Find the LAST assistant marker — that's this turn's response.
-    last_idx = post_no_ansi.rfind(marker)
-    if last_idx < 0:
-        return clean_output(post_no_ansi)
-    after = post_no_ansi[last_idx:]
+    # Two extraction modes:
+    #   - new_turn (assistant produced a response): start from the LAST marker.
+    #   - no new_turn (CLI sitting at a permission prompt with no response yet):
+    #     using rfind(marker) would point at the PREVIOUS turn's response and
+    #     leak it into this reply. Instead start from the user's echoed input.
+    if post_marker_count > pre_marker_count:
+        last_idx = post_no_ansi.rfind(marker)
+        after = post_no_ansi[last_idx:]
+    else:
+        echo_idx = post_no_ansi.rfind(user_text)
+        if echo_idx >= 0:
+            eol = post_no_ansi.find("\n", echo_idx)
+            after = post_no_ansi[eol + 1:] if eol >= 0 else ""
+        else:
+            last_idx = post_no_ansi.rfind(marker)
+            after = post_no_ansi[last_idx:] if last_idx >= 0 else post_no_ansi
 
     # Cut off at the input chrome that sits below the conversation — UNLESS a
     # permission dialog appears below the chrome (in which case the user needs
@@ -585,22 +601,22 @@ def make_handler(app):
             raise
 
     def update(channel, ts, text, blocks=None, cli=None):
+        # NOTE: chat.update doesn't accept username/icon_emoji — those are
+        # post-only. Updates inherit the identity from the original post,
+        # which is fine: if the placeholder was posted with the CLI's branded
+        # identity, the updated text keeps that identity automatically.
+        # The cli= kwarg is accepted for caller-symmetry but ignored here.
         kwargs = {"channel": channel, "ts": ts, "text": text}
         if blocks is not None:
             kwargs["blocks"] = blocks
-        if cli and cli in CLI_CONFIGS:
-            cfg = CLI_CONFIGS[cli]
-            if cfg.get("display_name"):
-                kwargs["username"] = cfg["display_name"]
-            if cfg.get("icon_emoji"):
-                kwargs["icon_emoji"] = cfg["icon_emoji"]
         try:
             return app.client.chat_update(**kwargs)
         except SlackApiError as e:
-            if e.response.get("error") in ("not_allowed", "missing_scope"):
-                return app.client.chat_update(channel=channel, ts=ts, text=text,
-                                              blocks=blocks if blocks is not None else None)
-            raise
+            print(f"[chat_update] {e.response.get('error')}: falling back to new post")
+            # If update fails for any reason, post a fresh reply so the user
+            # at least sees the response.
+            return app.client.chat_postMessage(channel=channel, text=text,
+                                               blocks=blocks if blocks is not None else None)
 
     def handle(user, channel, text, thread_ts):
         cmd = text.split()[0].lower() if text else ""
