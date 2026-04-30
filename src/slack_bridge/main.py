@@ -123,7 +123,13 @@ CLI_CONFIGS = {
         "trust_keys": "1",  # "1. Trust folder"
     },
     "codex": {
-        "cmd": "codex --no-alt-screen -s workspace-write",
+        # Plain `codex -s workspace-write` — DO NOT add --no-alt-screen.
+        # In v0.114.0, --no-alt-screen mode causes codex to ignore stdin written
+        # by `tmux send-keys` (likely reads from /dev/tty directly), so the
+        # bridge can't deliver user messages. Alt-screen mode preserves send-keys
+        # delivery; we just lose tmux scrollback (acceptable since the bridge
+        # only needs the latest assistant turn anyway).
+        "cmd": "codex -s workspace-write",
         "ready_marker": "›",
         "assistant_marker": "•",
     },
