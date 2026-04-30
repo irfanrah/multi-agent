@@ -310,6 +310,8 @@ CHROME_DIVIDER_RE = re.compile(
     r"|^▀{3,}\s*$"                       # Gemini box bottom
     r"|^\s*Shift\+Tab to accept edits\s*$"
     r"|^.*\d+%\s+left\b.*$"              # Codex footer: "gpt-X · N% left · /path"
+    r"|^\s*›\s+(?!\d+\.)"                # Codex input placeholder ("› Explain this codebase")
+                                          # — but NOT dialog options like "› 1. Yes"
     r"|^\s*❯\s*$",                       # Claude empty input prompt
     re.MULTILINE,
 )
@@ -335,8 +337,13 @@ THINKING_RE = re.compile(r"⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏")
 
 
 def _is_responding(text):
-    """Heuristic: is the CLI still rendering/thinking?"""
-    return ("Thinking" in text or "Working" in text or "esc to cancel" in text
+    """Heuristic: is the CLI still rendering/thinking?
+
+    NOTE: do NOT match "esc to cancel" — codex permission dialogs include
+    "Press enter to confirm or esc to cancel" in their footer, which would
+    cause false positives and prevent the bridge from ever returning.
+    """
+    return ("Thinking" in text or "Working" in text
             or bool(THINKING_RE.search(text)))
 
 
