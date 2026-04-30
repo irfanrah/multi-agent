@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Captured CLI outputs contain account email, session IDs, and paths — keep local only.
+output/check_limit/*.txt

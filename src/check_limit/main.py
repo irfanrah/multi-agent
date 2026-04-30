@@ -1,0 +1,124 @@
+import os
+import subprocess
+import time
+import re
+
+BOX_CHARS = r"[│╭╯╰╮─█░▝▘▛▜▟▞▖▗▎▏▬·]"
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+OUTPUT_DIR = os.path.join(REPO_ROOT, "output", "check_limit")
+
+def capture_cli_usage(command, session_name="usage_check", send_keys=None, startup_wait=10, post_wait=4):
+    """Run a command in tmux, optionally type a slash command, capture the UI, kill the session.
+
+    `send_keys` is used for CLIs (like Codex) where slash commands only work
+    interactively — passing them as CLI args sends them to the model as a prompt.
+    The text and Enter are sent in two separate calls with a small gap so any
+    autocomplete dropdown has time to settle before submission.
+    """
+    try:
+        subprocess.run(["tmux", "kill-session", "-t", session_name], stderr=subprocess.DEVNULL)
+        subprocess.run(["tmux", "new-session", "-d", "-s", session_name, "-x", "200", "-y", "50", command])
+        time.sleep(startup_wait)
+        if send_keys:
+            # Use -l so text is sent literally (no key-name interpretation).
+            subprocess.run(["tmux", "send-keys", "-t", session_name, "-l", send_keys])
+            time.sleep(1.5)
+            subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"])
+            time.sleep(post_wait)
+        result = subprocess.check_output(["tmux", "capture-pane", "-pt", session_name], text=True)
+        subprocess.run(["tmux", "kill-session", "-t", session_name])
+        return result
+    except Exception as e:
+        return f"Error: {e}"
+
+def _clean(line):
+    return re.sub(r"\s+", " ", re.sub(BOX_CHARS, " ", line)).strip()
+
+def parse_claude(text):
+    """Claude /usage: label line, then bar + N% used, then 'Resets ...'."""
+    lines = [_clean(l) for l in text.split("\n")]
+    labels = {"Current session", "Current week (all models)", "Current week (Sonnet only)"}
+    results = []
+    current = None
+    for i, line in enumerate(lines):
+        if line in labels:
+            current = line
+            continue
+        m = re.search(r"(\d+)%\s*used", line)
+        if m and current:
+            pct = int(m.group(1))
+            reset = ""
+            if i + 1 < len(lines):
+                rm = re.match(r"Resets\s+(.+)", lines[i + 1])
+                if rm:
+                    reset = f" (resets {rm.group(1).strip()})"
+            results.append(f"{current}: {pct}% used{reset}")
+            current = None
+    return " | ".join(results) if results else "Usage not found"
+
+def parse_gemini(text):
+    """Gemini /model: 'Flash <bar> 24% Resets: 2:49 PM (21h 29m)'."""
+    results = []
+    for line in text.split("\n"):
+        c = _clean(line)
+        m = re.match(r"^(Flash Lite|Flash|Pro)\s+(\d+)%(?:\s*Resets?:?\s*(.+))?$", c)
+        if m:
+            label, pct, reset = m.group(1), m.group(2), m.group(3)
+            entry = f"{label}: {pct}% used"
+            if reset:
+                entry += f" (resets {reset.strip()})"
+            results.append(entry)
+    return " | ".join(results) if results else "Usage not found"
+
+def parse_codex(text):
+    """Codex /status panel: '5h limit: [bar] 49% left (resets 19:28)' etc."""
+    results = []
+    for line in text.split("\n"):
+        c = _clean(line)
+        # Match labelled limits: "5h limit: [bar] 49% left (resets 19:28)" — bar leaves "[ ]" after _clean strips █/░.
+        m = re.match(r"^([A-Za-z0-9][A-Za-z0-9 ]*?limit):.*?(\d+)%\s*(used|left)\s*(?:\(resets?\s+([^)]+)\))?",
+                     c, re.IGNORECASE)
+        if m:
+            label, val, kind, reset = m.group(1).strip(), int(m.group(2)), m.group(3).lower(), m.group(4)
+            used = 100 - val if kind == "left" else val
+            entry = f"{label}: {used}% used ({100 - used}% left)"
+            if reset:
+                entry += f" (resets {reset.strip()})"
+            results.append(entry)
+    if results:
+        return " | ".join(results)
+    # Fallback: footer-only line "gpt-5.4 default · 100% left · /path" (· stripped to space).
+    for line in text.split("\n"):
+        c = _clean(line)
+        m = re.match(r"^(\S+)\s+(\S+)\s+(\d+)%\s*(used|left)\b", c)
+        if m:
+            model, plan, val, kind = m.group(1), m.group(2), int(m.group(3)), m.group(4).lower()
+            used = 100 - val if kind == "left" else val
+            return f"{model} ({plan}): {used}% used ({100 - used}% left)"
+    return "Usage not found"
+
+PARSERS = {"Claude": parse_claude, "Gemini": parse_gemini, "Codex": parse_codex}
+
+if __name__ == "__main__":
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    # For Codex, slash commands only work interactively, so launch the REPL and send /status.
+    clis = {
+        "Claude": {"cmd": "claude /usage"},
+        "Gemini": {"cmd": "gemini /model"},
+        "Codex":  {"cmd": "codex", "send_keys": "/status", "post_wait": 10},
+    }
+    print("=== AI CLI USAGE SUMMARY (via TMUX) ===")
+    for name, opts in clis.items():
+        print(f"Checking {name}...")
+        raw = capture_cli_usage(
+            opts["cmd"], f"check_{name.lower()}",
+            send_keys=opts.get("send_keys"),
+            post_wait=opts.get("post_wait", 4),
+        )
+        out_path = os.path.join(OUTPUT_DIR, f"{name.lower()}_output.txt")
+        with open(out_path, "w") as f:
+            f.write(raw)
+        summary = PARSERS[name](raw)
+        print(f"  Summary: {summary}")
+        print(f"  (Raw saved to {os.path.relpath(out_path, REPO_ROOT)})\n")
