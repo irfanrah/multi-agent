@@ -5,3 +5,8 @@ venv/
 
 # Captured CLI outputs contain account email, session IDs, and paths — keep local only.
 output/check_limit/*.txt
+
+# Secrets — NEVER commit. Use .env.example as the template.
+.env
+.env.local
+*.env

@@ -313,11 +313,33 @@ def make_handler(app):
     return handle
 
 
+def _load_dotenv():
+    """Load KEY=VALUE pairs from a .env file at the repo root, if present.
+    Existing env vars take precedence."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (os.path.join(here, ".env"),
+                      os.path.join(here, "..", "..", ".env")):
+        path = os.path.abspath(candidate)
+        if not os.path.isfile(path):
+            continue
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key, val = key.strip(), val.strip().strip('"').strip("'")
+                os.environ.setdefault(key, val)
+        return path
+    return None
+
+
 def main():
+    _load_dotenv()
     bot_token = os.environ.get("SLACK_BOT_TOKEN")
     app_token = os.environ.get("SLACK_APP_TOKEN")
     if not bot_token or not app_token:
-        sys.exit("Set SLACK_BOT_TOKEN and SLACK_APP_TOKEN env vars (see module docstring).")
+        sys.exit("Set SLACK_BOT_TOKEN and SLACK_APP_TOKEN (env vars or .env file). See .env.example.")
 
     app = App(token=bot_token)
     handle = make_handler(app)
