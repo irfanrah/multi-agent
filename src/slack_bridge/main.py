@@ -288,6 +288,21 @@ CHROME_DIVIDER_RE = re.compile(
     r"|^\s*❯\s*$",                       # Claude empty input prompt
     re.MULTILINE,
 )
+
+# A permission/tool-use dialog the user must answer. If we see one of these
+# patterns BELOW the chrome divider, we keep the dialog in the response so the
+# user can read it in Slack and reply with their choice.
+PERMISSION_DIALOG_RE = re.compile(
+    r"Do you want to proceed\?"
+    r"|Allow this (?:action|command|tool)"
+    r"|❯\s*\d+\.\s*(?:Yes|Allow|Trust|Approve)"
+    r"|\[\s*y\s*/\s*n\s*\]"
+    r"|\[\s*Y\s*/\s*n\s*\]"
+    r"|\[\s*y\s*/\s*N\s*\]",
+    re.IGNORECASE,
+)
+# End-of-dialog footer to clip at, so we don't include the post-dialog chrome.
+DIALOG_END_RE = re.compile(r"^\s*Esc to cancel\b.*$", re.MULTILINE)
 THINKING_RE = re.compile(r"⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏")
 
 
@@ -349,10 +364,20 @@ def send_and_wait(name, user_text, cli, max_wait=180, response_stable_secs=3.5,
         return clean_output(post_no_ansi)
     after = post_no_ansi[last_idx:]
 
-    # Cut off at the input chrome that sits below the conversation.
+    # Cut off at the input chrome that sits below the conversation — UNLESS a
+    # permission dialog appears below the chrome (in which case the user needs
+    # to see it in Slack to answer).
     chrome = CHROME_DIVIDER_RE.search(after)
     if chrome:
-        after = after[:chrome.start()]
+        below = after[chrome.end():]
+        if PERMISSION_DIALOG_RE.search(below):
+            # Keep through the dialog. Trim at the dialog's "Esc to cancel" footer.
+            end = DIALOG_END_RE.search(after, chrome.end())
+            if end:
+                after = after[:end.start()]
+            # else: include everything to end of pane
+        else:
+            after = after[:chrome.start()]
 
     cleaned = clean_output(after)
     # Strip a leading marker char so the response reads naturally.
