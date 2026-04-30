@@ -20,6 +20,7 @@ Required env:
 Required Slack scopes: app_mentions:read, chat:write, im:history, im:read,
 im:write. Subscribe to events: message.im, app_mention.
 """
+import importlib.util
 import os
 import re
 import sys
@@ -30,6 +31,19 @@ from dataclasses import dataclass, field
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+
+
+def _load_check_limit():
+    """Load src/check_limit/main.py as a distinct module (avoids name collision)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.normpath(os.path.join(here, "..", "check_limit", "main.py"))
+    spec = importlib.util.spec_from_file_location("check_limit_main", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_check_limit = None  # lazy-loaded
 
 # ---- terminal cleanup --------------------------------------------------------
 
@@ -213,6 +227,73 @@ def cleanup_idle_loop():
                 del sessions[k]
 
 
+# ---- check_limit integration -------------------------------------------------
+
+def run_check_limit():
+    """Run the three usage captures in parallel and return a Slack-formatted summary."""
+    global _check_limit
+    if _check_limit is None:
+        _check_limit = _load_check_limit()
+    cl = _check_limit
+
+    targets = [
+        ("Claude", "claude /usage", cl.parse_claude_rows, 3, None, None),
+        ("Gemini", "gemini /model", cl.parse_gemini_rows, 3, None, None),
+        ("Codex",  "codex",         cl.parse_codex_rows,  2, "/status", lambda t: "›" in t),
+    ]
+    results = {}
+    lock = threading.Lock()
+
+    def worker(name, cmd, parser, expected, send_keys, prompt_ready):
+        try:
+            raw = cl.capture_cli_usage(
+                cmd, f"slack_chk_{name.lower()}",
+                send_keys=send_keys,
+                prompt_ready=prompt_ready,
+                ready_check=lambda t: len(parser(t)) >= expected,
+                max_wait=45,
+            )
+            with lock:
+                results[name] = parser(raw)
+        except Exception as e:
+            with lock:
+                results[name] = [{"label": f"error: {e}", "pct_used": -1, "reset": None}]
+
+    threads = [threading.Thread(target=worker, args=t, daemon=True) for t in targets]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    return _format_check_limit(results)
+
+
+def _format_check_limit(results):
+    lines = ["*AI CLI Usage*"]
+    for name in ("Claude", "Gemini", "Codex"):
+        rows = results.get(name) or []
+        lines.append(f"\n*{name}*")
+        if not rows:
+            lines.append("  _(no data)_")
+            continue
+        for r in rows:
+            pct = r.get("pct_used", 0)
+            bar = _pct_bar(pct) if pct >= 0 else ""
+            line = f"  • {r['label']}: *{pct}%* used"
+            if bar:
+                line += f" {bar}"
+            if r.get("reset"):
+                line += f" _(resets {r['reset']})_"
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _pct_bar(pct, width=10):
+    pct = max(0, min(100, int(pct)))
+    filled = round(pct * width / 100)
+    return f"`{'█' * filled}{'░' * (width - filled)}`"
+
+
 # ---- Slack glue --------------------------------------------------------------
 
 def _format_for_slack(text):
@@ -272,6 +353,17 @@ def make_handler(app):
             handle(user, channel, f"!{cli}", thread_ts)
             return
 
+        if cmd in ("!check_limit", "!limits", "!check"):
+            placeholder = post(channel, ":mag: Checking AI CLI limits…", thread_ts)
+            ts = placeholder["ts"]
+            try:
+                summary = run_check_limit()
+            except Exception as e:
+                update(channel, ts, f":warning: check_limit error: `{e}`")
+                return
+            update(channel, ts, summary)
+            return
+
         if cmd == "!status":
             with sessions_lock:
                 sess = sessions.get(key)
@@ -288,6 +380,7 @@ def make_handler(app):
                  "`!gemini` start Gemini session\n"
                  "`!codex` start Codex session\n"
                  "`!claude` start Claude session\n"
+                 "`!check_limit` show usage limits for all CLIs\n"
                  "`!status` show active session\n"
                  "`!reset` restart current session\n"
                  "`!end` stop current session\n"
