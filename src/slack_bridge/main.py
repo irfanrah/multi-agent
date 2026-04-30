@@ -151,11 +151,15 @@ CLI_CONFIGS = {
         "icon_emoji": ":sparkles:",
     },
     "codex": {
-        # Plain `codex -s workspace-write` — DO NOT add --no-alt-screen.
-        # In v0.114.0, --no-alt-screen mode causes codex to ignore stdin written
-        # by `tmux send-keys` (likely reads from /dev/tty directly), so the
-        # bridge can't deliver user messages.
-        "cmd": "codex -s workspace-write",
+        # `-s workspace-write` sandboxes file writes to the cwd.
+        # `-a untrusted` makes codex ask before running ANY command that isn't
+        # in its trusted-read-only set (ls/cat/grep/etc.) — so writes, deletes,
+        # shell commands, network calls all surface a prompt the user answers
+        # in Slack. Default `on-request` lets the model auto-approve workspace
+        # ops, which is unsafe for a remote-controlled bridge.
+        # NOTE: do NOT add --no-alt-screen — codex v0.114.0 ignores stdin
+        # written by tmux send-keys when in inline mode.
+        "cmd": "codex -s workspace-write -a untrusted",
         "ready_marker": "›",
         "assistant_marker": "•",
         "display_name": "CLI Bridge — Codex",
