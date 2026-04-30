@@ -796,10 +796,12 @@ def make_handler(app):
             post(channel, "No active session. Start one with `!gemini`, `!codex`, or `!claude`.", thread_ts)
             return
 
-        # Use the CLI's branded identity for in-agent-channel posts; bare for DMs/etc.
-        post_cli = sess.cli if sess.is_named else None
+        # IMPORTANT: post placeholder WITHOUT custom username/icon. Slack's
+        # chat.update rejects updates on messages with overridden identity, which
+        # would leave the placeholder permanently stuck on "Thinking…" while the
+        # real response gets posted as a separate message.
         placeholder = post(channel, ":hourglass_flowing_sand: Thinking…",
-                           thread_ts=thread_ts, cli=post_cli)
+                           thread_ts=thread_ts)
         ts = placeholder["ts"]
         # Per-session lock prevents two concurrent Slack messages from typing into
         # the same tmux session in parallel and stomping each other's keystrokes.
@@ -807,11 +809,11 @@ def make_handler(app):
             try:
                 response = send_and_wait(sess.tmux_name, text, sess.cli)
             except Exception as e:
-                update(channel, ts, f":warning: Error: `{e}`", cli=post_cli)
+                update(channel, ts, f":warning: Error: `{e}`")
                 return
             sess.last_used = time.time()
 
-        update(channel, ts, _format_for_slack(response), cli=post_cli)
+        update(channel, ts, _format_for_slack(response))
 
     return handle
 
