@@ -20,10 +20,12 @@ Required env:
 Required Slack scopes (Bot Token):
   Core:           app_mentions:read, chat:write, im:history, im:read, im:write
   Named sessions: groups:write, groups:read, groups:history
+  File uploads:   files:write   (for !upload command)
   Branded posts:  chat:write.customize  (optional — for "CLI Bridge — Gemini" identity)
 
 Subscribe to bot events: app_mention, message.im, message.groups
 """
+import glob
 import importlib.util
 import os
 import re
@@ -738,6 +740,57 @@ def make_handler(app):
                 post(channel, "No active session. Try `!gemini` or `!codex` first.", thread_ts)
             return
 
+        if cmd in ("!upload", "!file", "!files"):
+            # Upload local file(s) to this Slack channel. Relative paths are
+            # resolved against the active session's cwd; globs are expanded.
+            parts = text.split()[1:]
+            if not parts:
+                post(channel,
+                     "Usage: `!upload <path>` (paths can be absolute, relative "
+                     "to session cwd, or globs). Multiple paths allowed.",
+                     thread_ts)
+                return
+            with sessions_lock:
+                sess = sessions.get(channel)
+            base = sess.path if (sess and sess.path) else os.getcwd()
+            resolved = []
+            for p in parts:
+                # Resolve relative paths against session cwd, then glob.
+                full = p if os.path.isabs(p) else os.path.join(base, p)
+                matches = glob.glob(full)
+                if matches:
+                    resolved.extend(matches)
+                else:
+                    resolved.append(full)  # so we can report it as missing
+            uploaded, failed = [], []
+            for path in resolved[:20]:  # cap so a stray * doesn't spam Slack
+                if not os.path.isfile(path):
+                    failed.append(f"`{path}` (not found)")
+                    continue
+                try:
+                    app.client.files_upload_v2(
+                        channel=channel, file=path,
+                        title=os.path.basename(path),
+                    )
+                    uploaded.append(os.path.basename(path))
+                except SlackApiError as e:
+                    err = e.response.get("error", "?")
+                    if err == "missing_scope":
+                        failed.append(
+                            f"`{os.path.basename(path)}` — bot needs `files:write` "
+                            "scope; add it in OAuth & Permissions and reinstall.")
+                        break  # no point retrying others with same error
+                    failed.append(f"`{os.path.basename(path)}` ({err})")
+            lines = []
+            if uploaded:
+                lines.append(f":outbox_tray: Uploaded {len(uploaded)} file(s).")
+            if failed:
+                lines.append("Issues:\n  • " + "\n  • ".join(failed))
+            if not lines:
+                lines.append("Nothing to upload.")
+            post(channel, "\n".join(lines), thread_ts)
+            return
+
         if cmd in ("!kill-server", "!killserver", "!nuke"):
             # Wipe everything: kill the entire tmux server (all bridge sessions),
             # clear our sessions dict, archive any orphan named channels.
@@ -787,6 +840,9 @@ def make_handler(app):
                  "\n"
                  "*Other*\n"
                  "`!check_limit` — usage % for Claude, Gemini, Codex with reset times\n"
+                 "`!upload <path>` — upload local file(s) to this channel. "
+                 "Paths can be absolute, relative to session cwd, or globs (e.g. "
+                 "`!upload assets/*.png`). Useful when an agent says \"I can't upload\".\n"
                  "`!kill-server` — `tmux kill-server`: wipe ALL bridge sessions and "
                  "archive their channels. Use when sessions are stuck or you want a "
                  "clean slate.\n"
