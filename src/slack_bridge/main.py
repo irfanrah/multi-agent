@@ -17,8 +17,12 @@ Required env:
   SLACK_BOT_TOKEN   xoxb-...   (bot user OAuth token)
   SLACK_APP_TOKEN   xapp-...   (app-level token, scope connections:write)
 
-Required Slack scopes: app_mentions:read, chat:write, im:history, im:read,
-im:write. Subscribe to events: message.im, app_mention.
+Required Slack scopes (Bot Token):
+  Core:           app_mentions:read, chat:write, im:history, im:read, im:write
+  Named sessions: groups:write, groups:read, groups:history
+  Branded posts:  chat:write.customize  (optional — for "CLI Bridge — Gemini" identity)
+
+Subscribe to bot events: app_mention, message.im, message.groups
 """
 import importlib.util
 import os
@@ -115,30 +119,36 @@ CLI_CONFIGS = {
     # `trust_pattern` + `trust_keys`: substring to detect first-launch folder-trust dialog
     # and the keystrokes to send to accept it. start_session auto-handles this so users
     # don't have to manually trust each new project folder.
+    # `display_name` + `icon_emoji`: bot identity used when posting in this CLI's
+    # dedicated agent channel (requires chat:write.customize scope; falls back gracefully).
     "gemini": {
         "cmd": "gemini",
         "ready_marker": "Type your message",
         "assistant_marker": "✦",
         "trust_pattern": "Do you trust the files in this folder",
-        "trust_keys": "1",  # "1. Trust folder"
+        "trust_keys": "1",
+        "display_name": "CLI Bridge — Gemini",
+        "icon_emoji": ":sparkles:",
     },
     "codex": {
         # Plain `codex -s workspace-write` — DO NOT add --no-alt-screen.
         # In v0.114.0, --no-alt-screen mode causes codex to ignore stdin written
         # by `tmux send-keys` (likely reads from /dev/tty directly), so the
-        # bridge can't deliver user messages. Alt-screen mode preserves send-keys
-        # delivery; we just lose tmux scrollback (acceptable since the bridge
-        # only needs the latest assistant turn anyway).
+        # bridge can't deliver user messages.
         "cmd": "codex -s workspace-write",
         "ready_marker": "›",
         "assistant_marker": "•",
+        "display_name": "CLI Bridge — Codex",
+        "icon_emoji": ":robot_face:",
     },
     "claude": {
         "cmd": "claude",
         "ready_marker": "? for shortcuts",
         "assistant_marker": "●",
         "trust_pattern": "Yes, I trust this folder",
-        "trust_keys": "1",  # "1. Yes, I trust this folder"
+        "trust_keys": "1",
+        "display_name": "CLI Bridge — Claude",
+        "icon_emoji": ":hatching_chick:",
     },
 }
 
@@ -208,7 +218,8 @@ def start_named_session(cli, name, path, inviter_user, app):
         raise ValueError(f"path not found or not a directory: `{path}`")
 
     slug = _slugify_channel(name)
-    base_name = f"agent-{slug}"
+    # Channel name includes the CLI so it's visible at a glance.
+    base_name = f"agent-{cli}-{slug}"
 
     # Try create as private; on name collision, append a short random suffix.
     channel_id = None
@@ -231,6 +242,14 @@ def start_named_session(cli, name, path, inviter_user, app):
         raise last_err or RuntimeError("could not create channel")
 
     app.client.conversations_invite(channel=channel_id, users=inviter_user)
+
+    # Set a useful channel topic — visible in Slack header.
+    try:
+        app.client.conversations_setTopic(
+            channel=channel_id,
+            topic=f"{cli} agent · cwd `{path}` · `!end` to stop")
+    except SlackApiError:
+        pass  # not critical
 
     tmux_name = f"slack_named_{channel_id}_{cli}".replace(".", "_")
     # 90s instead of 30s — snap apps (gemini, codex) can be slow to start under
@@ -500,14 +519,43 @@ def _format_for_slack(text):
 
 def make_handler(app):
     """Build the message handler bound to a slack_bolt App."""
-    def post(channel, text, thread_ts=None):
-        return app.client.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts)
+    def post(channel, text, thread_ts=None, cli=None, blocks=None):
+        kwargs = {"channel": channel, "text": text, "thread_ts": thread_ts}
+        if blocks is not None:
+            kwargs["blocks"] = blocks
+        if cli and cli in CLI_CONFIGS:
+            cfg = CLI_CONFIGS[cli]
+            if cfg.get("display_name"):
+                kwargs["username"] = cfg["display_name"]
+            if cfg.get("icon_emoji"):
+                kwargs["icon_emoji"] = cfg["icon_emoji"]
+        try:
+            return app.client.chat_postMessage(**kwargs)
+        except SlackApiError as e:
+            # Fall back to plain post if chat:write.customize scope is missing.
+            if e.response.get("error") in ("not_allowed", "missing_scope"):
+                return app.client.chat_postMessage(
+                    channel=channel, text=text, thread_ts=thread_ts,
+                    blocks=blocks if blocks is not None else None)
+            raise
 
-    def update(channel, ts, text, blocks=None):
+    def update(channel, ts, text, blocks=None, cli=None):
         kwargs = {"channel": channel, "ts": ts, "text": text}
         if blocks is not None:
             kwargs["blocks"] = blocks
-        return app.client.chat_update(**kwargs)
+        if cli and cli in CLI_CONFIGS:
+            cfg = CLI_CONFIGS[cli]
+            if cfg.get("display_name"):
+                kwargs["username"] = cfg["display_name"]
+            if cfg.get("icon_emoji"):
+                kwargs["icon_emoji"] = cfg["icon_emoji"]
+        try:
+            return app.client.chat_update(**kwargs)
+        except SlackApiError as e:
+            if e.response.get("error") in ("not_allowed", "missing_scope"):
+                return app.client.chat_update(channel=channel, ts=ts, text=text,
+                                              blocks=blocks if blocks is not None else None)
+            raise
 
     def handle(user, channel, text, thread_ts):
         cmd = text.split()[0].lower() if text else ""
@@ -543,9 +591,15 @@ def make_handler(app):
                 post(channel,
                      f":zap: Created <#{ch_id}|{ch_name}>, invited you, and launched `{cli}` in `{sess_path}`.",
                      thread_ts)
-                post(ch_id,
-                     f":zap: `{cli}` ready (cwd `{sess_path}`). Send any message. `!end` to stop and archive this channel.",
-                     None)
+                ready_text = (
+                    f":zap: `{cli}` ready in `{sess_path}`.\n"
+                    "Just type your message — no `!` or `@mention` needed.\n"
+                    "*Safety:* the agent runs with workspace-write permissions and "
+                    "asks before risky actions (file deletes, shell commands, network "
+                    "calls). When it asks, reply here in Slack with the option (`y`, "
+                    "`1`, etc) — the bridge forwards your answer."
+                )
+                post(ch_id, ready_text, cli=cli)
                 return
             # Existing one-channel-per-DM form.
             with sessions_lock:
@@ -568,7 +622,9 @@ def make_handler(app):
                 return
             kill_session(sess.tmux_name)
             if sess.is_named and sess.slack_channel_id:
-                post(sess.slack_channel_id, ":wave: Session ended. Archiving this channel.", None)
+                post(sess.slack_channel_id,
+                     ":wave: Session ended. Archiving this channel.",
+                     cli=sess.cli)
                 try:
                     app.client.conversations_archive(channel=sess.slack_channel_id)
                 except SlackApiError as e:
@@ -615,15 +671,33 @@ def make_handler(app):
 
         if cmd in ("!help", "help"):
             post(channel,
-                 "*Commands*\n"
-                 "`!gemini` / `!codex` / `!claude` — start session in this channel\n"
-                 "`!gemini <name> <path>` — create a dedicated channel + run CLI from `<path>`\n"
-                 "  (also works with `!codex` / `!claude`)\n"
-                 "`!check_limit` — show usage limits for all CLIs\n"
-                 "`!status` — show active session\n"
-                 "`!reset` — restart current session\n"
-                 "`!end` — stop current session (archives the channel if it was named)\n"
-                 "Anything else is forwarded to the active CLI.",
+                 "*CLI Bridge — commands*\n"
+                 "\n"
+                 "*Start a session*\n"
+                 "`!gemini`  /  `!codex`  /  `!claude`\n"
+                 "    Start a session in *this* channel (DM is best).\n"
+                 "`!gemini <name> <path>`  (also works with `!codex` / `!claude`)\n"
+                 "    Create a dedicated channel `#agent-<cli>-<name>`, invite you, "
+                 "launch the CLI with `cwd=<path>`. Each project gets its own channel.\n"
+                 "\n"
+                 "*Inside an agent channel*\n"
+                 "Type any plain message — no `@mention`, no `!`. The bridge forwards "
+                 "your text to the running CLI and posts back its reply.\n"
+                 "When the agent asks for permission (e.g. `Allow rm -rf? [y/n]`), "
+                 "answer right here in Slack — the bridge forwards your answer.\n"
+                 "\n"
+                 "*Session control*\n"
+                 "`!status` — what's running in this channel\n"
+                 "`!reset`  — kill the CLI and relaunch with the same config\n"
+                 "`!end`    — stop the session (named channels are archived)\n"
+                 "\n"
+                 "*Other*\n"
+                 "`!check_limit` — usage % for Claude, Gemini, Codex with reset times\n"
+                 "`!help` — this message\n"
+                 "\n"
+                 "*Safety:* agents run with workspace-write sandboxes and *ask before* "
+                 "risky actions (deletes, shell, network). The bridge can't auto-answer "
+                 "those — you do, in Slack.",
                  thread_ts)
             return
 
@@ -633,7 +707,10 @@ def make_handler(app):
             post(channel, "No active session. Start one with `!gemini`, `!codex`, or `!claude`.", thread_ts)
             return
 
-        placeholder = post(channel, ":hourglass_flowing_sand: Thinking…", thread_ts)
+        # Use the CLI's branded identity for in-agent-channel posts; bare for DMs/etc.
+        post_cli = sess.cli if sess.is_named else None
+        placeholder = post(channel, ":hourglass_flowing_sand: Thinking…",
+                           thread_ts=thread_ts, cli=post_cli)
         ts = placeholder["ts"]
         # Per-session lock prevents two concurrent Slack messages from typing into
         # the same tmux session in parallel and stomping each other's keystrokes.
@@ -641,11 +718,11 @@ def make_handler(app):
             try:
                 response = send_and_wait(sess.tmux_name, text, sess.cli)
             except Exception as e:
-                update(channel, ts, f":warning: Error: `{e}`")
+                update(channel, ts, f":warning: Error: `{e}`", cli=post_cli)
                 return
             sess.last_used = time.time()
 
-        update(channel, ts, _format_for_slack(response))
+        update(channel, ts, _format_for_slack(response), cli=post_cli)
 
     return handle
 
