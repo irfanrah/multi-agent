@@ -714,6 +714,31 @@ def make_handler(app):
                 post(channel, "No active session. Try `!gemini` or `!codex` first.", thread_ts)
             return
 
+        if cmd in ("!kill-server", "!killserver", "!nuke"):
+            # Wipe everything: kill the entire tmux server (all bridge sessions),
+            # clear our sessions dict, archive any orphan named channels.
+            with sessions_lock:
+                snapshot = list(sessions.items())
+                sessions.clear()
+            try:
+                subprocess.run(["tmux", "kill-server"], stderr=subprocess.DEVNULL)
+            except Exception as e:
+                post(channel, f":warning: tmux kill-server failed: `{e}`", thread_ts)
+                return
+            archived = 0
+            for ch_id, sess in snapshot:
+                if sess.is_named and sess.slack_channel_id:
+                    try:
+                        app.client.conversations_archive(channel=sess.slack_channel_id)
+                        archived += 1
+                    except SlackApiError:
+                        pass
+            post(channel,
+                 f":bomb: tmux kill-server done. "
+                 f"Killed {len(snapshot)} session(s); archived {archived} agent channel(s).",
+                 thread_ts)
+            return
+
         if cmd in ("!help", "help"):
             post(channel,
                  "*CLI Bridge — commands*\n"
@@ -738,6 +763,9 @@ def make_handler(app):
                  "\n"
                  "*Other*\n"
                  "`!check_limit` — usage % for Claude, Gemini, Codex with reset times\n"
+                 "`!kill-server` — `tmux kill-server`: wipe ALL bridge sessions and "
+                 "archive their channels. Use when sessions are stuck or you want a "
+                 "clean slate.\n"
                  "`!help` — this message\n"
                  "\n"
                  "*Safety:* agents run with workspace-write sandboxes and *ask before* "
