@@ -118,14 +118,15 @@ CLI_CONFIGS = {
         "assistant_marker": "✦",
     },
     "codex": {
-        # -a never: never ask for approval; -s workspace-write: sandbox writes to cwd;
-        # --no-alt-screen: inline TUI so tmux capture-pane sees full history.
-        "cmd": "codex --no-alt-screen -a never -s workspace-write",
+        # --no-alt-screen: inline TUI so tmux capture-pane sees full scrollback.
+        # -s workspace-write: sandbox writes to cwd. Keep default approval policy
+        # so prompts get forwarded to Slack and the user answers there.
+        "cmd": "codex --no-alt-screen -s workspace-write",
         "ready_marker": "›",
         "assistant_marker": "•",
     },
     "claude": {
-        "cmd": "claude --dangerously-skip-permissions",
+        "cmd": "claude",
         "ready_marker": "? for shortcuts",
         "assistant_marker": "●",
     },
@@ -242,11 +243,16 @@ def _is_responding(text):
             or bool(THINKING_RE.search(text)))
 
 
-def send_and_wait(name, user_text, cli, max_wait=180, stable_secs=3.5, poll=1.0):
-    """Send user_text + Enter, wait for the response, return cleaned text.
+def send_and_wait(name, user_text, cli, max_wait=180, response_stable_secs=3.5,
+                  idle_stable_secs=8.0, poll=1.0):
+    """Send user_text + Enter, wait for the CLI to settle, return cleaned text.
 
-    These TUIs redraw the same screen region rather than scrolling, so we extract
-    the response by finding the LAST assistant marker in the post-capture.
+    Two settle conditions; whichever fires first ends the wait:
+      - response_stable_secs of stability with a NEW assistant marker visible
+        (the CLI just produced an answer and is idle).
+      - idle_stable_secs of stability without a new marker AND no spinner
+        (the CLI is sitting at a permission prompt or other input dialog —
+        forward it to Slack so the user can answer there).
     """
     cfg = CLI_CONFIGS[cli]
     marker = cfg["assistant_marker"]
@@ -258,20 +264,25 @@ def send_and_wait(name, user_text, cli, max_wait=180, stable_secs=3.5, poll=1.0)
     time.sleep(0.4)
     _tmux("send-keys", "-t", name, "Enter")
 
-    last, stable_at = "", None
+    last, response_stable_at, idle_stable_at = "", None, None
     deadline = time.time() + max_wait
     while time.time() < deadline:
         cur = capture(name)
-        # We want a NEW assistant turn (marker count increased) AND the pane
-        # has been stable AND nothing is "thinking".
-        new_turn = cur.count(marker) > pre_marker_count
-        if new_turn and cur == last and not _is_responding(cur):
-            if stable_at is None:
-                stable_at = time.time()
-            elif time.time() - stable_at >= stable_secs:
-                break
+        if cur == last and not _is_responding(cur):
+            new_turn = cur.count(marker) > pre_marker_count
+            if new_turn:
+                if response_stable_at is None:
+                    response_stable_at = time.time()
+                elif time.time() - response_stable_at >= response_stable_secs:
+                    break
+            else:
+                if idle_stable_at is None:
+                    idle_stable_at = time.time()
+                elif time.time() - idle_stable_at >= idle_stable_secs:
+                    break
         else:
-            stable_at = None
+            response_stable_at = None
+            idle_stable_at = None
             last = cur
         time.sleep(poll)
 
