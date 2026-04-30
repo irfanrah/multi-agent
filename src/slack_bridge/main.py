@@ -110,9 +110,25 @@ def capture(name):
 CLI_CONFIGS = {
     # `ready_marker`: appears once the CLI's input prompt is ready.
     # `assistant_marker`: prefix the CLI uses for assistant turns in the conversation log.
-    "gemini": {"cmd": "gemini", "ready_marker": "Type your message",  "assistant_marker": "✦"},
-    "codex":  {"cmd": "codex",  "ready_marker": "›",                   "assistant_marker": "•"},
-    "claude": {"cmd": "claude", "ready_marker": "? for shortcuts",     "assistant_marker": "●"},
+    # `cmd`: launched via tmux; flags are tuned so the CLI doesn't sit on permission prompts
+    # (which the bridge can't answer) and so output stays in scrollback (no alt-screen).
+    "gemini": {
+        "cmd": "gemini",
+        "ready_marker": "Type your message",
+        "assistant_marker": "✦",
+    },
+    "codex": {
+        # -a never: never ask for approval; -s workspace-write: sandbox writes to cwd;
+        # --no-alt-screen: inline TUI so tmux capture-pane sees full history.
+        "cmd": "codex --no-alt-screen -a never -s workspace-write",
+        "ready_marker": "›",
+        "assistant_marker": "•",
+    },
+    "claude": {
+        "cmd": "claude --dangerously-skip-permissions",
+        "ready_marker": "? for shortcuts",
+        "assistant_marker": "●",
+    },
 }
 
 
