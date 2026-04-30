@@ -1,12 +1,13 @@
 """Slack <-> CLI bridge with stateful tmux sessions.
 
 A Slack DM (or channel where the bot is invited) becomes a persistent chat with
-either Gemini CLI or Codex CLI. Each (user, channel) keeps its own tmux session
-so context persists across messages.
+Gemini CLI, Codex CLI, or Claude Code. Each (user, channel) keeps its own tmux
+session so context persists across messages.
 
 Slack commands:
   !gemini     Start (or restart) a Gemini session
   !codex      Start (or restart) a Codex session
+  !claude     Start (or restart) a Claude session
   !end        End current session
   !status     Show what's active
   !reset      Same as !end + relaunch with same CLI
@@ -92,8 +93,9 @@ def capture(name):
 CLI_CONFIGS = {
     # `ready_marker`: appears once the CLI's input prompt is ready.
     # `assistant_marker`: prefix the CLI uses for assistant turns in the conversation log.
-    "gemini": {"cmd": "gemini", "ready_marker": "Type your message", "assistant_marker": "✦"},
-    "codex":  {"cmd": "codex",  "ready_marker": "›",                  "assistant_marker": "•"},
+    "gemini": {"cmd": "gemini", "ready_marker": "Type your message",  "assistant_marker": "✦"},
+    "codex":  {"cmd": "codex",  "ready_marker": "›",                   "assistant_marker": "•"},
+    "claude": {"cmd": "claude", "ready_marker": "? for shortcuts",     "assistant_marker": "●"},
 }
 
 
@@ -128,12 +130,13 @@ def kill_session(name):
 
 
 CHROME_DIVIDER_RE = re.compile(
-    r"^\s*\?\s+for\s+shortcuts\s*$"     # Gemini help hint
-    r"|^─{3,}\s*$"                       # Gemini input separator
+    r"^.*\?\s+for\s+shortcuts.*$"        # Gemini/Claude help hint (may have trailing status)
+    r"|^─{3,}.*$"                        # Horizontal divider (Gemini, Claude)
     r"|^▄{3,}\s*$"                       # Gemini box top
     r"|^▀{3,}\s*$"                       # Gemini box bottom
     r"|^\s*Shift\+Tab to accept edits\s*$"
-    r"|^\s*›\s",                         # Codex input prompt (next placeholder)
+    r"|^\s*›\s"                          # Codex input prompt (next placeholder)
+    r"|^\s*❯\s*$",                       # Claude empty input prompt
     re.MULTILINE,
 )
 THINKING_RE = re.compile(r"⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏")
@@ -232,7 +235,7 @@ def make_handler(app):
         key = (user, channel)
         cmd = text.split()[0].lower() if text else ""
 
-        if cmd in ("!gemini", "!codex"):
+        if cmd in ("!gemini", "!codex", "!claude"):
             cli = cmd[1:]
             with sessions_lock:
                 if key in sessions:
@@ -284,6 +287,7 @@ def make_handler(app):
                  "*Commands*\n"
                  "`!gemini` start Gemini session\n"
                  "`!codex` start Codex session\n"
+                 "`!claude` start Claude session\n"
                  "`!status` show active session\n"
                  "`!reset` restart current session\n"
                  "`!end` stop current session\n"
@@ -294,7 +298,7 @@ def make_handler(app):
         with sessions_lock:
             sess = sessions.get(key)
         if not sess:
-            post(channel, "No active session. Start one with `!gemini` or `!codex`.", thread_ts)
+            post(channel, "No active session. Start one with `!gemini`, `!codex`, or `!claude`.", thread_ts)
             return
 
         placeholder = post(channel, ":hourglass_flowing_sand: Thinking…", thread_ts)
