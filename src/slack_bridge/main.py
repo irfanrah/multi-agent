@@ -59,6 +59,20 @@ BOX_RE = re.compile(r"[│╭╯╰╮─█░▝▘▛▜▟▞▖▗▎▏▬
 SPINNER_CHARS = set("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◑◒◓◴◷◶◵|/-\\")
 PROMPT_PREFIXES = ("›", "❯", ">_", ">>", ">", "•")
 
+# Per-CLI footer noise we always want to drop from response text:
+#   "✻ Brewed for 5s" — Claude's "thinking time" indicator (Brewed/Cooked/
+#     Churned/Pondered/etc.)
+#   "⎿  Running…" — Claude's transient tool-running line; the actual result
+#     replaces it on next render, so it's pure noise by the time we capture.
+#   "Press Esc to interrupt" — codex/claude transient hint
+NOISE_LINE_RE = re.compile(
+    r"^\s*✻\s+\w+\s+for\s+\d+s\s*$"
+    r"|^\s*⎿\s+(?:Running|Streaming|Loading|Waiting)…?\s*$"
+    r"|^\s*\(?(?:Press\s+)?[Ee]sc\s+to\s+(?:interrupt|cancel|exit).*$"
+)
+# Strip leading assistant marker so each Claude tool-call line reads naturally.
+LEADING_MARKER_RE = re.compile(r"^([●•✦])\s+")
+
 
 def clean_output(text):
     text = ANSI_RE.sub("", text)
@@ -76,6 +90,12 @@ def clean_output(text):
         # Drop empty prompt lines like "›" or "❯ ".
         if any(stripped == p or stripped == p + " " for p in PROMPT_PREFIXES):
             continue
+        # Drop CLI noise (timing hints, transient running indicators).
+        if NOISE_LINE_RE.match(line):
+            continue
+        # Strip the leading "● " / "• " / "✦ " marker so chained tool-call lines
+        # don't look like bullet points in Slack.
+        line = LEADING_MARKER_RE.sub("", line, count=1)
         out_lines.append(line)
     # Collapse multiple blank lines.
     collapsed, blank = [], False
@@ -379,11 +399,7 @@ def send_and_wait(name, user_text, cli, max_wait=180, response_stable_secs=3.5,
         else:
             after = after[:chrome.start()]
 
-    cleaned = clean_output(after)
-    # Strip a leading marker char so the response reads naturally.
-    if cleaned.startswith(marker):
-        cleaned = cleaned[len(marker):].lstrip()
-    return cleaned
+    return clean_output(after)
 
 
 def cleanup_idle_loop(app=None):
