@@ -265,33 +265,74 @@ def run_check_limit():
     for t in threads:
         t.join()
 
-    return _format_check_limit(results)
+    return format_check_limit(results)
 
 
-def _format_check_limit(results):
-    lines = ["*AI CLI Usage*"]
+def format_check_limit(results):
+    """Return (text_fallback, blocks) for chat_update."""
+    from datetime import datetime
+    blocks = [
+        {"type": "header",
+         "text": {"type": "plain_text", "text": "📊 AI CLI Usage", "emoji": True}},
+        {"type": "context",
+         "elements": [{"type": "mrkdwn",
+                       "text": f"_Updated {datetime.now().strftime('%b %d, %H:%M')}_"}]},
+    ]
+    text_lines = ["AI CLI Usage"]
     for name in ("Claude", "Gemini", "Codex"):
         rows = results.get(name) or []
-        lines.append(f"\n*{name}*")
-        if not rows:
-            lines.append("  _(no data)_")
-            continue
+        blocks.append({"type": "divider"})
+        blocks.append({"type": "section",
+                       "text": {"type": "mrkdwn", "text": _section_md(name, rows)}})
+        text_lines.append(f"\n{name}")
         for r in rows:
-            pct = r.get("pct_used", 0)
-            bar = _pct_bar(pct) if pct >= 0 else ""
-            line = f"  • {r['label']}: *{pct}%* used"
-            if bar:
-                line += f" {bar}"
-            if r.get("reset"):
-                line += f" _(resets {r['reset']})_"
-            lines.append(line)
-    return "\n".join(lines)
+            text_lines.append(f"  {r['label']}: {r.get('pct_used', 0)}% used")
+    return "\n".join(text_lines), blocks
+
+
+def _section_md(name, rows):
+    if not rows:
+        return f"⚪ *{name}*\n_(no data)_"
+    pcts = [r.get("pct_used", 0) for r in rows if r.get("pct_used", 0) >= 0]
+    overall = max(pcts) if pcts else 0
+    head = f"{_status_emoji(overall)} *{name}*"
+    body_lines = [head]
+    for r in rows:
+        body_lines.append(_row_md(r))
+    return "\n".join(body_lines)
+
+
+def _row_md(r):
+    pct = r.get("pct_used", 0)
+    label = r["label"]
+    if pct < 0:
+        return f"  ⚠️ _{label}_"
+    bar = _pct_bar(pct)
+    pct_str = f"{pct:>3d}%"
+    line = f"  `{pct_str}` {bar}  {label}"
+    reset = _clean_reset(r.get("reset"))
+    if reset:
+        line += f"  _·  resets {reset}_"
+    return line
+
+
+def _status_emoji(pct):
+    if pct >= 80: return "🔴"
+    if pct >= 50: return "🟡"
+    return "🟢"
 
 
 def _pct_bar(pct, width=10):
     pct = max(0, min(100, int(pct)))
     filled = round(pct * width / 100)
     return f"`{'█' * filled}{'░' * (width - filled)}`"
+
+
+def _clean_reset(reset):
+    if not reset:
+        return None
+    # Drop redundant timezone tags like " (Asia/Seoul)"
+    return re.sub(r"\s*\([A-Za-z]+/[\w_+-]+\)\s*$", "", reset).strip()
 
 
 # ---- Slack glue --------------------------------------------------------------
@@ -309,8 +350,11 @@ def make_handler(app):
     def post(channel, text, thread_ts=None):
         return app.client.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts)
 
-    def update(channel, ts, text):
-        return app.client.chat_update(channel=channel, ts=ts, text=text)
+    def update(channel, ts, text, blocks=None):
+        kwargs = {"channel": channel, "ts": ts, "text": text}
+        if blocks is not None:
+            kwargs["blocks"] = blocks
+        return app.client.chat_update(**kwargs)
 
     def handle(user, channel, text, thread_ts):
         key = (user, channel)
@@ -357,11 +401,11 @@ def make_handler(app):
             placeholder = post(channel, ":mag: Checking AI CLI limits…", thread_ts)
             ts = placeholder["ts"]
             try:
-                summary = run_check_limit()
+                fallback, blocks = run_check_limit()
             except Exception as e:
                 update(channel, ts, f":warning: check_limit error: `{e}`")
                 return
-            update(channel, ts, summary)
+            update(channel, ts, fallback, blocks=blocks)
             return
 
         if cmd == "!status":
