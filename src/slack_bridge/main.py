@@ -152,15 +152,16 @@ CLI_CONFIGS = {
         "icon_emoji": ":sparkles:",
     },
     "codex": {
-        # `-s workspace-write` sandboxes file writes to the cwd.
-        # `-a untrusted` makes codex ask before running ANY command that isn't
-        # in its trusted-read-only set (ls/cat/grep/etc.) — so writes, deletes,
-        # shell commands, network calls all surface a prompt the user answers
-        # in Slack. Default `on-request` lets the model auto-approve workspace
-        # ops, which is unsafe for a remote-controlled bridge.
+        # `-s workspace-write` sandboxes file writes to the cwd — codex can't
+        # touch /etc, /usr, the home dir outside the project, etc.
+        # `-a on-request` (codex's default) lets the model decide when to ask.
+        # In practice it auto-approves reads (find, sort, ls, cat, …) and asks
+        # before non-trivial mutations. We tried `-a untrusted` for stricter
+        # safety but it asks for every read-only command outside ~10 hardcoded
+        # ones — annoying. Workspace-write + on-request is the sweet spot.
         # NOTE: do NOT add --no-alt-screen — codex v0.114.0 ignores stdin
         # written by tmux send-keys when in inline mode.
-        "cmd": "codex -s workspace-write -a untrusted",
+        "cmd": "codex -s workspace-write -a on-request",
         "ready_marker": "›",
         "assistant_marker": "•",
         "display_name": "CLI Bridge — Codex",
