@@ -5,13 +5,24 @@ Gemini CLI, Codex CLI, or Claude Code. Each (user, channel) keeps its own tmux
 session so context persists across messages.
 
 Slack commands:
-  !gemini     Start (or restart) a Gemini session
-  !codex      Start (or restart) a Codex session
-  !claude     Start (or restart) a Claude session
-  !end        End current session
-  !status     Show what's active
-  !reset      Same as !end + relaunch with same CLI
-  <anything>  Forwarded to the active CLI session
+  !gemini / !codex / !claude   Start (or restart) a session
+  !gemini <name> <path>        Create #<cli>-<name>-<id> agent channel + launch CLI in <path>
+  !end                         End current session
+  !status                      Show what's active in this channel
+  !sessions / !ls              List every active bridge session globally
+  !reset                       Restart in place (same cli, cwd, model)
+  !cancel / !interrupt         Send Esc to interrupt the running CLI turn
+  !switch <cli>                Swap the CLI in this channel, keep cwd
+  !model <name>                Relaunch the active CLI with a model flag
+  !run <shell-cmd>             One-shot shell exec in the session's cwd
+  !upload <path>               Upload local file(s) to Slack
+  !download / !dl              Save a file attached to this message into session's cwd
+  !check_limit                 Usage % for Claude, Gemini, Codex with reset times
+  !kill-server / !nuke         tmux kill-server: wipe ALL bridge sessions
+  !help                        Print all commands
+  <anything else>              Forwarded to the active CLI session
+
+Sessions persist until !end / !reset / !kill-server (no idle timeout).
 
 Required env:
   SLACK_BOT_TOKEN   xoxb-...   (bot user OAuth token)
@@ -30,10 +41,13 @@ import importlib.util
 import os
 import re
 import secrets
-import sys
-import time
-import threading
+import shlex
+import shutil
 import subprocess
+import sys
+import threading
+import time
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -152,6 +166,7 @@ CLI_CONFIGS = {
         "trust_keys": "1",
         "display_name": "CLI Bridge — Gemini",
         "icon_emoji": ":sparkles:",
+        "model_flag": "-m",
     },
     "codex": {
         # `-s workspace-write` sandboxes file writes to the cwd — codex can't
@@ -168,6 +183,7 @@ CLI_CONFIGS = {
         "assistant_marker": "•",
         "display_name": "CLI Bridge — Codex",
         "icon_emoji": ":robot_face:",
+        "model_flag": "-m",
     },
     "claude": {
         "cmd": "claude",
@@ -177,6 +193,7 @@ CLI_CONFIGS = {
         "trust_keys": "1",
         "display_name": "CLI Bridge — Claude",
         "icon_emoji": ":hatching_chick:",
+        "model_flag": "--model",
     },
 }
 
@@ -189,6 +206,9 @@ class CLISession:
     path: Optional[str] = None
     slack_channel_id: Optional[str] = None
     is_named: bool = False  # True when this session owns its dedicated Slack channel
+    # Extra args appended to the CLI's launch command — currently used by !model
+    # to add e.g. "-m gpt-5" or "--model opus". Preserved across !reset.
+    extra_args: str = ""
     # Lock taken while a message is being typed/processed for this session.
     # Prevents two concurrent Slack messages from interleaving keystrokes.
     io_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -198,17 +218,22 @@ class CLISession:
 # uniquely identifies per-user DM sessions; named sessions live in their own channel.
 sessions: dict = {}
 sessions_lock = threading.Lock()
-IDLE_TIMEOUT_SEC = 30 * 60
+# Idle reaping is disabled — sessions persist until !end / !reset / !kill-server
+# (or host restart). cleanup_idle_loop is kept around for re-enable but is no
+# longer started in main(); flip the constant back to e.g. 30*60 and re-add the
+# Thread() spawn in main() to bring it back.
+IDLE_TIMEOUT_SEC = None
 
 
-def start_session(cli, name, max_wait=30, cwd=None):
+def start_session(cli, name, max_wait=30, cwd=None, extra_args=""):
     cfg = CLI_CONFIGS[cli]
     if session_exists(name):
         _tmux("kill-session", "-t", name)
     args = ["new-session", "-d", "-s", name, "-x", "200", "-y", "50"]
     if cwd:
         args += ["-c", cwd]
-    args.append(cfg["cmd"])
+    full_cmd = cfg["cmd"] + (" " + extra_args if extra_args else "")
+    args.append(full_cmd)
     _tmux(*args)
 
     trust_pattern = cfg.get("trust_pattern")
@@ -237,7 +262,12 @@ def _slugify_channel(name):
 
 
 def start_named_session(cli, name, path, inviter_user, app):
-    """Create channel `agent-<slug>`, invite inviter, launch tmux with cwd=path.
+    """Create channel `<cli>-<slug>-<uniqid>`, invite inviter, launch tmux with cwd=path.
+
+    The uniqid suffix is always present so re-running with the same project
+    name produces a fresh channel (Slack keeps archived channels around with
+    their old name otherwise) and so the channel name is unique on first try.
+    The tmux session uses the same name as the channel for easy lookup.
 
     Returns (channel_id, tmux_name, channel_name) on success.
     Raises ValueError on bad path. Raises SlackApiError or RuntimeError on Slack/CLI failures.
@@ -246,15 +276,15 @@ def start_named_session(cli, name, path, inviter_user, app):
         raise ValueError(f"path not found or not a directory: `{path}`")
 
     slug = _slugify_channel(name)
-    # Channel name includes the CLI so it's visible at a glance.
-    base_name = f"agent-{cli}-{slug}"
+    # Channel name format: <cli>-<project>-<uniqid>, e.g. codex-cctv_date_rename-b93c.
+    base_name = f"{cli}-{slug}"
 
-    # Try create as private; on name collision, append a short random suffix.
+    # Always append a random suffix; on the rare collision, just retry with a new one.
     channel_id = None
-    final_name = base_name
+    final_name = None
     last_err = None
-    for attempt in range(3):
-        try_name = base_name if attempt == 0 else f"{base_name}-{secrets.token_hex(2)}"
+    for _ in range(3):
+        try_name = f"{base_name}-{secrets.token_hex(2)}"
         try:
             resp = app.client.conversations_create(name=try_name, is_private=True)
             channel_id = resp["channel"]["id"]
@@ -279,7 +309,9 @@ def start_named_session(cli, name, path, inviter_user, app):
     except SlackApiError:
         pass  # not critical
 
-    tmux_name = f"slack_named_{channel_id}_{cli}".replace(".", "_")
+    # tmux session name == channel name. Channel names already conform to
+    # [a-z0-9_-] (see _slugify_channel), which tmux accepts cleanly.
+    tmux_name = final_name
     # 90s instead of 30s — snap apps (gemini, codex) can be slow to start under
     # memory/CPU pressure. If we timeout, capture the pane to help diagnose.
     if not start_session(cli, tmux_name, cwd=path, max_wait=90):
@@ -434,9 +466,16 @@ def send_and_wait(name, user_text, cli, max_wait=180, response_stable_secs=3.5,
 
 def cleanup_idle_loop(app=None):
     """Periodically kill tmux sessions that have been idle past the timeout.
-    For named sessions (with their own Slack channel), archive the channel too."""
+    For named sessions (with their own Slack channel), archive the channel too.
+
+    NOTE: not currently spawned by main() — sessions persist indefinitely. If
+    IDLE_TIMEOUT_SEC is None this loop becomes a no-op so accidentally
+    re-enabling the thread doesn't immediately wipe everything.
+    """
     while True:
         time.sleep(60)
+        if IDLE_TIMEOUT_SEC is None:
+            continue
         now = time.time()
         with sessions_lock:
             stale_keys = [k for k, s in sessions.items() if now - s.last_used > IDLE_TIMEOUT_SEC]
@@ -628,7 +667,7 @@ def make_handler(app):
             return app.client.chat_postMessage(channel=channel, text=text,
                                                blocks=blocks if blocks is not None else None)
 
-    def handle(user, channel, text, thread_ts):
+    def handle(user, channel, text, thread_ts, files=None):
         cmd = text.split()[0].lower() if text else ""
 
         if cmd in ("!gemini", "!codex", "!claude"):
@@ -707,14 +746,21 @@ def make_handler(app):
         if cmd == "!reset":
             with sessions_lock:
                 sess = sessions.get(channel)
-                cli = sess.cli if sess else None
-                if sess:
-                    kill_session(sess.tmux_name)
-                    del sessions[channel]
-            if not cli:
+            if not sess:
                 post(channel, "No active session to reset. Try `!gemini` or `!codex`.", thread_ts)
                 return
-            handle(user, channel, f"!{cli}", thread_ts)
+            # Restart in place: same cli, cwd, tmux name, extra_args, named status.
+            kill_session(sess.tmux_name)
+            ok = start_session(sess.cli, sess.tmux_name, cwd=sess.path,
+                               extra_args=sess.extra_args, max_wait=90)
+            if not ok:
+                with sessions_lock:
+                    sessions.pop(channel, None)
+                post(channel, f":warning: Failed to restart `{sess.cli}` (prompt didn't appear).", thread_ts)
+                return
+            sess.last_used = time.time()
+            extra = f" with `{sess.extra_args}`" if sess.extra_args else ""
+            post(channel, f":arrows_counterclockwise: Restarted `{sess.cli}`{extra}.", thread_ts)
             return
 
         if cmd in ("!check_limit", "!limits", "!check"):
@@ -735,7 +781,8 @@ def make_handler(app):
                 age = int(time.time() - sess.last_used)
                 tag = " (named)" if sess.is_named else ""
                 cwd = f", cwd `{sess.path}`" if sess.path else ""
-                post(channel, f":eyes: Active `{sess.cli}` session{tag} (idle {age}s, tmux `{sess.tmux_name}`{cwd}).", thread_ts)
+                extra = f", `{sess.extra_args}`" if sess.extra_args else ""
+                post(channel, f":eyes: Active `{sess.cli}` session{tag} (idle {age}s, tmux `{sess.tmux_name}`{cwd}{extra}).", thread_ts)
             else:
                 post(channel, "No active session. Try `!gemini` or `!codex` first.", thread_ts)
             return
@@ -816,6 +863,196 @@ def make_handler(app):
                  thread_ts)
             return
 
+        if cmd == "!run":
+            # One-shot shell command in the session's cwd. No agent involved.
+            rest = text[len(cmd):].strip()
+            if not rest:
+                post(channel, "Usage: `!run <shell command>` (runs in this session's cwd, 30s timeout).", thread_ts)
+                return
+            with sessions_lock:
+                sess = sessions.get(channel)
+            cwd = sess.path if (sess and sess.path) else os.getcwd()
+            try:
+                proc = subprocess.run(
+                    rest, shell=True, cwd=cwd,
+                    capture_output=True, text=True, timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                post(channel, ":alarm_clock: Command timed out after 30s.", thread_ts)
+                return
+            except Exception as e:
+                post(channel, f":warning: `!run` error: `{e}`", thread_ts)
+                return
+            CAP = 6000
+            parts = []
+            if proc.stdout.strip():
+                out = proc.stdout
+                trunc = "" if len(out) <= CAP else f"\n... (truncated, {len(out) - CAP} more bytes)"
+                parts.append(f"*stdout:*\n```\n{out[:CAP]}{trunc}\n```")
+            if proc.stderr.strip():
+                err = proc.stderr
+                trunc = "" if len(err) <= CAP else f"\n... (truncated, {len(err) - CAP} more bytes)"
+                parts.append(f"*stderr:*\n```\n{err[:CAP]}{trunc}\n```")
+            if proc.returncode != 0:
+                parts.append(f"_exit {proc.returncode}_")
+            if not parts:
+                parts.append(f"_(exit {proc.returncode}, no output)_")
+            post(channel, "\n".join(parts), thread_ts)
+            return
+
+        if cmd in ("!download", "!dl"):
+            # Pull files attached to the same Slack message into the session's cwd.
+            if not files:
+                post(channel,
+                     "Attach a file to the same message and include `!download` "
+                     "(or `!dl`) in the text.",
+                     thread_ts)
+                return
+            with sessions_lock:
+                sess = sessions.get(channel)
+            base = sess.path if (sess and sess.path) else os.getcwd()
+            saved, failed = [], []
+            bot_token = app.client.token
+            for f in (files or [])[:10]:
+                url = f.get("url_private_download") or f.get("url_private")
+                name = f.get("name") or f.get("id") or "download"
+                if not url:
+                    failed.append(f"`{name}` (no URL)")
+                    continue
+                # Strip path components — never let a Slack-controlled name
+                # write outside the session cwd.
+                safe = os.path.basename(name) or "download"
+                dest = os.path.join(base, safe)
+                try:
+                    req = urllib.request.Request(
+                        url, headers={"Authorization": f"Bearer {bot_token}"},
+                    )
+                    with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as out:
+                        shutil.copyfileobj(r, out)
+                    saved.append(safe)
+                except Exception as e:
+                    failed.append(f"`{safe}` ({e})")
+            lines = []
+            if saved:
+                lines.append(
+                    f":inbox_tray: Saved {len(saved)} file(s) to `{base}`: "
+                    + ", ".join(f"`{n}`" for n in saved))
+            if failed:
+                lines.append("Issues:\n  • " + "\n  • ".join(failed))
+            if not lines:
+                lines.append("Nothing downloaded.")
+            post(channel, "\n".join(lines), thread_ts)
+            return
+
+        if cmd in ("!cancel", "!interrupt", "!stop"):
+            with sessions_lock:
+                sess = sessions.get(channel)
+            if not sess:
+                post(channel, "No active session.", thread_ts)
+                return
+            # Esc is the documented interrupt key for all three CLIs ("Press Esc
+            # to interrupt"). We deliberately do NOT send Ctrl-C — that risks
+            # killing the CLI process entirely.
+            _tmux("send-keys", "-t", sess.tmux_name, "Escape")
+            sess.last_used = time.time()
+            post(channel, f":octagonal_sign: Sent interrupt to `{sess.cli}`.", thread_ts)
+            return
+
+        if cmd == "!switch":
+            parts = text.split(maxsplit=1)
+            valid = "/".join(f"`{c}`" for c in CLI_CONFIGS)
+            if len(parts) < 2 or parts[1].strip().lower() not in CLI_CONFIGS:
+                post(channel, f"Usage: `!switch <{'|'.join(CLI_CONFIGS)}>`. Valid: {valid}.", thread_ts)
+                return
+            new_cli = parts[1].strip().lower()
+            with sessions_lock:
+                sess = sessions.get(channel)
+            if not sess:
+                post(channel, "No active session. Start one first with `!gemini`/`!codex`/`!claude`.", thread_ts)
+                return
+            if new_cli == sess.cli:
+                post(channel, f"Already running `{new_cli}`.", thread_ts)
+                return
+            kill_session(sess.tmux_name)
+            ok = start_session(new_cli, sess.tmux_name, cwd=sess.path, max_wait=90)
+            if not ok:
+                with sessions_lock:
+                    sessions.pop(channel, None)
+                post(channel,
+                     f":warning: Failed to start `{new_cli}` — prompt didn't appear within 90s. "
+                     "Session removed; restart with `!{new_cli}`.",
+                     thread_ts)
+                return
+            with sessions_lock:
+                sess.cli = new_cli
+                sess.extra_args = ""  # different CLI, model flags don't carry over
+                sess.last_used = time.time()
+            cwd_note = f" in `{sess.path}`" if sess.path else ""
+            post(channel,
+                 f":arrows_counterclockwise: Switched to `{new_cli}`{cwd_note}.",
+                 thread_ts)
+            return
+
+        if cmd == "!model":
+            parts = text.split(maxsplit=1)
+            with sessions_lock:
+                sess = sessions.get(channel)
+            if not sess:
+                post(channel, "No active session.", thread_ts)
+                return
+            cfg = CLI_CONFIGS[sess.cli]
+            flag = cfg.get("model_flag")
+            if not flag:
+                post(channel, f":warning: `{sess.cli}` does not support `!model`.", thread_ts)
+                return
+            if len(parts) < 2 or not parts[1].strip():
+                cur = f"`{sess.extra_args}`" if sess.extra_args else "(default)"
+                post(channel,
+                     f"Current `{sess.cli}` extra args: {cur}. Usage: `!model <name>` "
+                     f"(e.g. `!model opus`, `!model gpt-5`, `!model gemini-2.5-flash`).",
+                     thread_ts)
+                return
+            model = parts[1].strip()
+            extra = f"{flag} {shlex.quote(model)}"
+            kill_session(sess.tmux_name)
+            ok = start_session(sess.cli, sess.tmux_name, cwd=sess.path,
+                               extra_args=extra, max_wait=90)
+            if not ok:
+                with sessions_lock:
+                    sessions.pop(channel, None)
+                post(channel,
+                     f":warning: Failed to relaunch `{sess.cli}` with `{extra}`. "
+                     "The model name may be invalid; session removed.",
+                     thread_ts)
+                return
+            with sessions_lock:
+                sess.extra_args = extra
+                sess.last_used = time.time()
+            post(channel,
+                 f":arrows_counterclockwise: Restarted `{sess.cli}` with `{extra}`.",
+                 thread_ts)
+            return
+
+        if cmd in ("!sessions", "!ls", "!list"):
+            now = time.time()
+            with sessions_lock:
+                snapshot = list(sessions.items())
+            if not snapshot:
+                post(channel, "No active sessions.", thread_ts)
+                return
+            lines = [f"*{len(snapshot)} active session(s):*"]
+            for ch_id, s in snapshot:
+                age = int(now - s.last_used)
+                ch_link = f"<#{ch_id}>" if s.is_named else f"`{ch_id}`"
+                cwd = f", cwd `{s.path}`" if s.path else ""
+                extra = f", `{s.extra_args}`" if s.extra_args else ""
+                named = " (named)" if s.is_named else ""
+                lines.append(
+                    f"  • {ch_link} — `{s.cli}`{named}, idle {age}s, "
+                    f"tmux `{s.tmux_name}`{cwd}{extra}")
+            post(channel, "\n".join(lines), thread_ts)
+            return
+
         if cmd in ("!help", "help"):
             post(channel,
                  "*CLI Bridge — commands*\n"
@@ -824,7 +1061,8 @@ def make_handler(app):
                  "`!gemini`  /  `!codex`  /  `!claude`\n"
                  "    Start a session in *this* channel (DM is best).\n"
                  "`!gemini <name> <path>`  (also works with `!codex` / `!claude`)\n"
-                 "    Create a dedicated channel `#agent-<cli>-<name>`, invite you, "
+                 "    Create a dedicated channel `#<cli>-<name>-<uniqid>` "
+                 "(e.g. `#codex-cctv_date_rename-b93c`), invite you, "
                  "launch the CLI with `cwd=<path>`. Each project gets its own channel.\n"
                  "\n"
                  "*Inside an agent channel*\n"
@@ -835,14 +1073,26 @@ def make_handler(app):
                  "\n"
                  "*Session control*\n"
                  "`!status` — what's running in this channel\n"
-                 "`!reset`  — kill the CLI and relaunch with the same config\n"
+                 "`!reset`  — kill the CLI and relaunch with the same config (cli, cwd, model)\n"
+                 "`!cancel` (alias `!interrupt`, `!stop`) — send Esc to the active CLI to interrupt mid-turn\n"
+                 "`!switch <gemini|codex|claude>` — swap the CLI in this channel, keep the cwd\n"
+                 "`!model <name>` — relaunch the active CLI with a model flag "
+                 "(e.g. `!model opus`, `!model gpt-5`, `!model gemini-2.5-flash`)\n"
                  "`!end`    — stop the session (named channels are archived)\n"
                  "\n"
-                 "*Other*\n"
-                 "`!check_limit` — usage % for Claude, Gemini, Codex with reset times\n"
+                 "*Files & shell*\n"
+                 "`!run <cmd>` — run a shell command in the session's cwd (30s timeout). "
+                 "Token-free way to peek at state (`!run git status`, `!run ls`).\n"
                  "`!upload <path>` — upload local file(s) to this channel. "
                  "Paths can be absolute, relative to session cwd, or globs (e.g. "
-                 "`!upload assets/*.png`). Useful when an agent says \"I can't upload\".\n"
+                 "`!upload assets/*.png`).\n"
+                 "`!download` (alias `!dl`) — attach a file to your message + include "
+                 "`!download` to save it into the session's cwd. Useful for sharing "
+                 "screenshots or PDFs with the agent.\n"
+                 "\n"
+                 "*Other*\n"
+                 "`!sessions` (alias `!ls`) — list every active bridge session globally\n"
+                 "`!check_limit` — usage % for Claude, Gemini, Codex with reset times\n"
                  "`!kill-server` — `tmux kill-server`: wipe ALL bridge sessions and "
                  "archive their channels. Use when sessions are stuck or you want a "
                  "clean slate.\n"
@@ -850,7 +1100,9 @@ def make_handler(app):
                  "\n"
                  "*Safety:* agents run with workspace-write sandboxes and *ask before* "
                  "risky actions (deletes, shell, network). The bridge can't auto-answer "
-                 "those — you do, in Slack.",
+                 "those — you do, in Slack. `!run` is local shell; mind what you type.\n"
+                 "*Lifetime:* sessions persist until you `!end` / `!reset` / `!kill-server` "
+                 "(no idle timeout).",
                  thread_ts)
             return
 
@@ -915,18 +1167,25 @@ def main():
 
     @app.event("message")
     def on_message(event, logger):
-        if event.get("bot_id") or event.get("subtype"):
-            print(f"[message] skipped (bot_id or subtype): {event.get('subtype')}")
+        if event.get("bot_id"):
+            return
+        # Allow file_share subtype through — file uploads land as messages with
+        # subtype="file_share" (legacy) or no subtype but with a `files` array
+        # (modern). Skip other subtypes (channel joins, edits, etc).
+        subtype = event.get("subtype")
+        files = event.get("files") or []
+        if subtype and not files:
+            print(f"[message] skipped subtype={subtype}")
             return
         user = event.get("user")
         channel = event.get("channel")
         text = (event.get("text") or "").strip()
-        print(f"[message] from {user} in {channel}: {text!r}")
-        if not user or not channel or not text:
+        print(f"[message] from {user} in {channel}: {text!r} files={len(files)}")
+        if not user or not channel or (not text and not files):
             return
         threading.Thread(
             target=handle,
-            args=(user, channel, text, event.get("thread_ts")),
+            args=(user, channel, text, event.get("thread_ts"), files),
             daemon=True,
         ).start()
 
@@ -938,13 +1197,14 @@ def main():
         # Strip leading bot mention. Slack may use <@U123>, <@U123|name>, or
         # occasionally lowercase IDs — match permissively.
         text = re.sub(r"^<@[\w]+(\|[^>]+)?>\s*", "", raw)
+        files = event.get("files") or []
         print(f"[app_mention] from {user} in {channel}: raw={raw!r} stripped={text!r}")
-        if not user or not channel or not text:
+        if not user or not channel or (not text and not files):
             print("[app_mention] dropped: missing user/channel/text")
             return
         threading.Thread(
             target=handle,
-            args=(user, channel, text, event.get("thread_ts")),
+            args=(user, channel, text, event.get("thread_ts"), files),
             daemon=True,
         ).start()
 
@@ -953,7 +1213,10 @@ def main():
     def _noop_edit(event, logger):
         pass
 
-    threading.Thread(target=cleanup_idle_loop, args=(app,), daemon=True).start()
+    # Idle-reaping is disabled by design — sessions persist until !end / !reset
+    # / !kill-server (or host restart). To re-enable, uncomment the line below
+    # and set IDLE_TIMEOUT_SEC at the top of the file to e.g. 30*60.
+    # threading.Thread(target=cleanup_idle_loop, args=(app,), daemon=True).start()
     print("Slack bridge running. DM your bot or @mention it in a channel.")
     SocketModeHandler(app, app_token).start()
 
