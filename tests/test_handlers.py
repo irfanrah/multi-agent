@@ -13,7 +13,9 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -38,8 +40,10 @@ class FakeClient:
         self.archived = []
 
     def chat_postMessage(self, **kw):
-        self.posts.append(kw)
-        return {"ts": str(len(self.posts)), "channel": kw.get("channel")}
+        ts = str(len(self.posts) + 1)
+        record = dict(kw, ts=ts)
+        self.posts.append(record)
+        return {"ts": ts, "channel": kw.get("channel")}
 
     def chat_update(self, **kw):
         self.updates.append(kw)
@@ -97,6 +101,31 @@ def last_post_text(app, channel=None):
         if channel is None or p.get("channel") == channel:
             return p.get("text", "")
     return ""
+
+
+def latest_visible_text(app, channel=None):
+    """Most recent text the user would see — accounts for chat.update
+    overwriting an earlier placeholder. Walks both posts and updates by ts."""
+    rows = []
+    for p in app.client.posts:
+        if channel is None or p.get("channel") == channel:
+            rows.append((p.get("ts"), p.get("text", "")))
+    # Apply updates: latest update for a given ts wins.
+    by_ts = dict(rows)
+    for u in app.client.updates:
+        if channel is None or u.get("channel") == channel:
+            if u.get("ts") in by_ts:
+                by_ts[u["ts"]] = u.get("text", "")
+    if not by_ts:
+        return ""
+    # Return the text for the most-recently-touched ts.
+    last_ts = None
+    for ts, _ in rows:
+        last_ts = ts
+    for u in app.client.updates:
+        if channel is None or u.get("channel") == channel:
+            last_ts = u.get("ts", last_ts)
+    return by_ts.get(last_ts, "")
 
 
 # ---- !run --------------------------------------------------------------------
@@ -455,6 +484,737 @@ class IdleDisabledTests(unittest.TestCase):
 
         # No session should have been reaped.
         self.assertEqual(set(before), set(bridge.sessions))
+
+
+# ---- !upload folder-zip ------------------------------------------------------
+
+class UploadFolderTests(unittest.TestCase):
+    def setUp(self):
+        self.handle, self.app = fresh_handler()
+        # Build a tree under a tempdir that we can pass to !upload absolutely.
+        import tempfile as _t
+        self.td = _t.mkdtemp(prefix="bridge_uptest_")
+        # Real files we expect to ship.
+        os.makedirs(os.path.join(self.td, "src"))
+        Path(self.td, "src", "main.py").write_text("print('hi')\n")
+        Path(self.td, "README.md").write_text("readme\n")
+        # Junk we expect to skip.
+        os.makedirs(os.path.join(self.td, ".git"))
+        Path(self.td, ".git", "HEAD").write_text("ref: refs/heads/main\n")
+        os.makedirs(os.path.join(self.td, "__pycache__"))
+        Path(self.td, "__pycache__", "x.pyc").write_text("\x00\x00\x00\x00")
+        os.makedirs(os.path.join(self.td, "node_modules"))
+        Path(self.td, "node_modules", "lib.js").write_text("module.exports={}\n")
+
+    def tearDown(self):
+        import shutil as _s
+        _s.rmtree(self.td, ignore_errors=True)
+
+    def _zip_path_from_call(self, call):
+        # files_upload_v2 receives the zip path via the `file` kwarg. We need
+        # to peek at the file BEFORE the handler unlinks it; the FakeClient
+        # doesn't read the bytes, so the zip is still on disk inside its call,
+        # but is removed in the handler's `finally`. Workaround: copy the
+        # file aside on first call.
+        return call["file"]
+
+    def test_directory_zips_and_uploads(self):
+        seed_session()
+        # Capture the zip's contents at call time before the handler deletes it.
+        captured_namelist = {}
+
+        def fake_upload(**kw):
+            with zipfile.ZipFile(kw["file"]) as zf:
+                captured_namelist["names"] = sorted(zf.namelist())
+                captured_namelist["title"] = kw.get("title")
+            self.app.client.uploads.append(kw)
+            return {"ok": True}
+
+        with mock.patch.object(self.app.client, "files_upload_v2", side_effect=fake_upload):
+            # --direct skips the picker.
+            self.handle("U", "D1", f"!upload --direct {self.td}", None)
+
+        self.assertEqual(len(self.app.client.uploads), 1)
+        names = captured_namelist["names"]
+        base = os.path.basename(self.td)
+        self.assertIn(f"{base}/src/main.py", names)
+        self.assertIn(f"{base}/README.md", names)
+        # Junk excluded.
+        self.assertFalse(any(".git/" in n for n in names),
+                         f".git/ should be excluded, got: {names}")
+        self.assertFalse(any("__pycache__/" in n for n in names))
+        self.assertFalse(any("node_modules/" in n for n in names))
+        self.assertEqual(captured_namelist["title"], f"{base}.zip")
+        self.assertIn("Uploaded 1", last_post_text(self.app))
+
+    def test_directory_size_cap_refuses(self):
+        seed_session()
+        # Cap is 1 GB; lie about size to trip it.
+        with mock.patch.object(bridge, "directory_size_for_zip",
+                               return_value=2 * 1024 * 1024 * 1024):
+            with mock.patch.object(self.app.client, "files_upload_v2") as up:
+                self.handle("U", "D1", f"!upload --direct {self.td}", None)
+        up.assert_not_called()
+        text = last_post_text(self.app)
+        self.assertIn("MB", text)
+        self.assertIn("cap", text)
+
+    def test_mixed_file_and_directory(self):
+        seed_session()
+        single_file = os.path.join(self.td, "README.md")
+        captured = []
+
+        def fake_upload(**kw):
+            captured.append(kw.get("title"))
+            return {"ok": True}
+
+        with mock.patch.object(self.app.client, "files_upload_v2", side_effect=fake_upload):
+            # Multi-path always goes direct; no picker.
+            self.handle("U", "D1", f"!upload {single_file} {self.td}", None)
+        # Both should have been uploaded — the file plus the dir-as-zip.
+        self.assertIn("README.md", captured)
+        self.assertIn(f"{os.path.basename(self.td)}.zip", captured)
+        self.assertIn("Uploaded 2", last_post_text(self.app))
+
+    def test_empty_directory_after_exclusions(self):
+        # Wipe the real-content dirs, leave only `.git`.
+        for sub in ("src", "README.md", "__pycache__", "node_modules"):
+            p = Path(self.td, sub)
+            if p.is_dir():
+                import shutil as _s
+                _s.rmtree(p)
+            elif p.exists():
+                p.unlink()
+        seed_session()
+        with mock.patch.object(self.app.client, "files_upload_v2") as up:
+            self.handle("U", "D1", f"!upload --direct {self.td}", None)
+        up.assert_not_called()
+        self.assertIn("no files to zip", last_post_text(self.app))
+
+    def test_zip_directory_helper_excludes_junk(self):
+        # Pure helper-level test: zip_directory must exclude the same set the
+        # handler reports, regardless of where it's called from.
+        out = os.path.join(self.td, "out.zip")
+        try:
+            n = bridge.zip_directory(self.td, out)
+            with zipfile.ZipFile(out) as zf:
+                names = zf.namelist()
+            base = os.path.basename(self.td)
+            self.assertGreater(n, 0)
+            self.assertIn(f"{base}/src/main.py", names)
+            self.assertIn(f"{base}/README.md", names)
+            for junk in (".git/HEAD", "__pycache__/x.pyc", "node_modules/lib.js"):
+                self.assertFalse(any(n.endswith(junk) for n in names),
+                                 f"junk leaked into zip: {junk} in {names}")
+        finally:
+            if os.path.exists(out):
+                os.unlink(out)
+
+
+# ---- !upload menu (1/2 picker) + pixeldrain link path -----------------------
+
+class UploadMenuTests(unittest.TestCase):
+    def setUp(self):
+        self.handle, self.app = fresh_handler()
+        # Reset the module-level pending dict so tests don't leak state.
+        with bridge.pending_uploads_lock:
+            bridge.pending_uploads.clear()
+        import tempfile as _t
+        self.td = _t.mkdtemp(prefix="bridge_menutest_")
+        os.makedirs(os.path.join(self.td, "src"))
+        Path(self.td, "src", "main.py").write_text("print('hi')\n")
+        Path(self.td, "README.md").write_text("readme\n")
+
+    def tearDown(self):
+        import shutil as _s
+        _s.rmtree(self.td, ignore_errors=True)
+        with bridge.pending_uploads_lock:
+            bridge.pending_uploads.clear()
+
+    # -- picker prompt --------------------------------------------------------
+
+    def test_single_path_prompts_menu(self):
+        seed_session()
+        with mock.patch.object(self.app.client, "files_upload_v2") as up:
+            self.handle("U", "D1", f"!upload {self.td}", None)
+        up.assert_not_called()
+        text = last_post_text(self.app)
+        self.assertIn("Upload", text)
+        self.assertIn("`1`", text)
+        self.assertIn("`2`", text)
+        self.assertIn("pixeldrain", text)
+        # Pending state recorded for this channel.
+        with bridge.pending_uploads_lock:
+            self.assertIn("D1", bridge.pending_uploads)
+            self.assertEqual(bridge.pending_uploads["D1"]["source"], self.td)
+
+    def test_pick_1_runs_direct_upload(self):
+        seed_session()
+        # First message stages the pending upload + posts the menu.
+        with mock.patch.object(self.app.client, "files_upload_v2") as up_a:
+            self.handle("U", "D1", f"!upload {self.td}", None)
+        up_a.assert_not_called()
+
+        # Pick "1" — should drain pending and run the direct flow.
+        captured = []
+        def fake_upload(**kw):
+            captured.append(kw.get("title"))
+            return {"ok": True}
+        with mock.patch.object(self.app.client, "files_upload_v2", side_effect=fake_upload):
+            self.handle("U", "D1", "1", None)
+        self.assertIn(f"{os.path.basename(self.td)}.zip", captured)
+        self.assertIn("Uploaded 1", last_post_text(self.app))
+        with bridge.pending_uploads_lock:
+            self.assertNotIn("D1", bridge.pending_uploads)
+
+    def test_pick_2_runs_link_upload(self):
+        seed_session()
+        self.handle("U", "D1", f"!upload {self.td}", None)
+        # Inspect the zip *inside* the mocked PUT call — the handler's `finally`
+        # deletes the temp dir on return, so we can't inspect after the fact.
+        captured = {}
+
+        def fake_put(zip_path, **_kw):
+            captured["path"] = zip_path
+            captured["exists"] = os.path.isfile(zip_path)
+            with zipfile.ZipFile(zip_path) as zf:
+                captured["names"] = sorted(zf.namelist())
+                zf.setpassword(bridge.LINK_UPLOAD_PASSWORD.encode())
+                base = os.path.basename(self.td)
+                captured["payload"] = zf.read(f"{base}/src/main.py")
+                # Reading without a password must fail (proof it's encrypted).
+                zf.setpassword(None)
+                try:
+                    zf.read(f"{base}/src/main.py")
+                    captured["unencrypted"] = True
+                except RuntimeError:
+                    captured["unencrypted"] = False
+            return "https://pixeldrain.com/u/xyz"
+
+        with mock.patch.object(bridge, "pixeldrain_put", side_effect=fake_put), \
+             mock.patch.object(self.app.client, "files_upload_v2") as up:
+            self.handle("U", "D1", "2", None)
+        up.assert_not_called()  # Slack file-upload not used in link flow.
+        self.assertTrue(captured["exists"])
+        base = os.path.basename(self.td)
+        self.assertTrue(any(n.startswith(f"{base}/") for n in captured["names"]))
+        self.assertIn(b"print", captured["payload"])
+        self.assertFalse(captured["unencrypted"],
+                         "zip must require the password to read")
+        text = latest_visible_text(self.app)
+        self.assertIn("pixeldrain.com/u/xyz", text)
+        self.assertIn(bridge.LINK_UPLOAD_PASSWORD, text)
+        with bridge.pending_uploads_lock:
+            self.assertNotIn("D1", bridge.pending_uploads)
+
+    def test_bang_prefixed_pick_works(self):
+        seed_session()
+        self.handle("U", "D1", f"!upload {self.td}", None)
+        with mock.patch.object(self.app.client, "files_upload_v2") as up:
+            self.handle("U", "D1", "!1", None)
+        up.assert_called_once()
+
+    def test_pick_with_no_pending_falls_through(self):
+        # No pending — bare "1" must NOT consume the menu and must NOT post a
+        # spurious message. (It falls through to the "no active session"
+        # message below since there's no CLI session in this test fixture.)
+        with mock.patch.object(self.app.client, "files_upload_v2") as up:
+            self.handle("U", "D1", "1", None)
+        up.assert_not_called()
+        # Whatever else gets posted, it must not look like an upload report.
+        for p in self.app.client.posts:
+            self.assertNotIn("Uploaded", p.get("text", ""))
+            self.assertNotIn("pixeldrain", p.get("text", ""))
+
+    def test_pick_after_ttl_expired_falls_through(self):
+        seed_session()
+        self.handle("U", "D1", f"!upload {self.td}", None)
+        # Force-expire the pending entry.
+        with bridge.pending_uploads_lock:
+            bridge.pending_uploads["D1"]["expires_at"] = time.time() - 1
+        with mock.patch.object(self.app.client, "files_upload_v2") as up:
+            self.handle("U", "D1", "1", None)
+        up.assert_not_called()
+
+    # -- explicit flag forms (no picker) -------------------------------------
+
+    def test_link_flag_skips_menu(self):
+        seed_session()
+        with mock.patch.object(bridge, "pixeldrain_put",
+                               return_value="https://pixeldrain.com/u/yzw") as tput:
+            self.handle("U", "D1", f"!upload --link {self.td}", None)
+        tput.assert_called_once()
+        # No pending stored (we went straight to the link flow).
+        with bridge.pending_uploads_lock:
+            self.assertNotIn("D1", bridge.pending_uploads)
+
+    def test_direct_flag_skips_menu(self):
+        seed_session()
+        with mock.patch.object(self.app.client, "files_upload_v2") as up:
+            self.handle("U", "D1", f"!upload --direct {self.td}", None)
+        up.assert_called_once()
+
+
+class PixeldrainPutTests(unittest.TestCase):
+    """pixeldrain_put PUTs the file body to the right URL, parses the JSON
+    response, and returns the `https://<host>/u/<id>` viewer link."""
+
+    def test_put_method_url_and_returns_link(self):
+        import tempfile as _t
+        with _t.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+            f.write(b"\x50\x4b\x03\x04test-zip-bytes")
+            path = f.name
+        try:
+            class FakeResp:
+                def __init__(self, body): self._body = body
+                def read(self): return self._body
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+            with mock.patch.object(bridge.urllib.request, "urlopen") as op:
+                op.return_value = FakeResp(b'{"id":"abc123","success":true}')
+                link = bridge.pixeldrain_put(path,
+                                             endpoint="https://pixeldrain.com")
+            self.assertEqual(link, "https://pixeldrain.com/u/abc123")
+            # Inspect the Request object passed to urlopen.
+            req = op.call_args.args[0]
+            self.assertEqual(req.method, "PUT")
+            self.assertTrue(req.full_url.startswith("https://pixeldrain.com/api/file/"))
+            self.assertTrue(req.full_url.endswith(os.path.basename(path)))
+            self.assertEqual(req.data[:4], b"\x50\x4b\x03\x04")
+        finally:
+            os.unlink(path)
+
+    def test_non_json_response_raises(self):
+        import tempfile as _t
+        with _t.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+            f.write(b"x")
+            path = f.name
+        try:
+            class FakeResp:
+                def __init__(self, body): self._body = body
+                def read(self): return self._body
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+            with mock.patch.object(bridge.urllib.request, "urlopen") as op:
+                op.return_value = FakeResp(b"<html>503 Service Unavailable</html>")
+                with self.assertRaises(RuntimeError):
+                    bridge.pixeldrain_put(path)
+        finally:
+            os.unlink(path)
+
+    def test_json_without_id_raises(self):
+        import tempfile as _t
+        with _t.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+            f.write(b"x")
+            path = f.name
+        try:
+            class FakeResp:
+                def __init__(self, body): self._body = body
+                def read(self): return self._body
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+            with mock.patch.object(bridge.urllib.request, "urlopen") as op:
+                op.return_value = FakeResp(b'{"success":false,"message":"bad"}')
+                with self.assertRaises(RuntimeError):
+                    bridge.pixeldrain_put(path)
+        finally:
+            os.unlink(path)
+
+
+class EncryptedZipBuilderTests(unittest.TestCase):
+    """make_encrypted_zip_for_upload produces password-protected archives
+    decryptable with the bridge's LINK_UPLOAD_PASSWORD."""
+
+    def setUp(self):
+        import tempfile as _t
+        self.td = _t.mkdtemp(prefix="bridge_enczip_")
+
+    def tearDown(self):
+        import shutil as _s
+        _s.rmtree(self.td, ignore_errors=True)
+
+    def test_encrypts_single_file(self):
+        src = os.path.join(self.td, "report.txt")
+        Path(src).write_text("secret payload\n")
+        out = os.path.join(self.td, "out.zip")
+        n = bridge.make_encrypted_zip_for_upload(
+            src, out, bridge.LINK_UPLOAD_PASSWORD)
+        self.assertEqual(n, 1)
+        with zipfile.ZipFile(out) as zf:
+            self.assertEqual(zf.namelist(), ["report.txt"])
+            zf.setpassword(bridge.LINK_UPLOAD_PASSWORD.encode())
+            self.assertEqual(zf.read("report.txt"), b"secret payload\n")
+
+    def test_encrypts_directory_excluding_junk(self):
+        src = os.path.join(self.td, "proj")
+        os.makedirs(os.path.join(src, "src"))
+        Path(src, "src", "a.py").write_text("x = 1\n")
+        os.makedirs(os.path.join(src, ".git"))
+        Path(src, ".git", "HEAD").write_text("ref\n")
+        out = os.path.join(self.td, "proj.zip")
+        n = bridge.make_encrypted_zip_for_upload(
+            src, out, bridge.LINK_UPLOAD_PASSWORD)
+        self.assertEqual(n, 1)  # only src/a.py; .git skipped
+        with zipfile.ZipFile(out) as zf:
+            names = zf.namelist()
+            self.assertIn("proj/src/a.py", names)
+            self.assertFalse(any(".git" in nm for nm in names))
+            zf.setpassword(bridge.LINK_UPLOAD_PASSWORD.encode())
+            self.assertEqual(zf.read("proj/src/a.py"), b"x = 1\n")
+
+
+# ---- three-tier fallback helpers --------------------------------------------
+
+class PendingDialogTests(unittest.TestCase):
+    """extract_pending_dialog scans the pane for a permission prompt and
+    returns the question + options, clipped at the dialog footer."""
+
+    def test_returns_empty_when_no_dialog(self):
+        with mock.patch.object(bridge, "capture", return_value="some output\nnothing here"):
+            self.assertEqual(bridge.extract_pending_dialog("any"), "")
+
+    def test_finds_apply_this_change(self):
+        pane = (
+            "  some old work\n"
+            "\n"
+            "  Apply this change?\n"
+            "\n"
+            "  ● 1. Allow once\n"
+            "    2. Allow for this session\n"
+            "    3. Modify with external editor\n"
+            "    4. No, suggest changes (esc)\n"
+            "\n"
+            " > Type your message or @path/to/file\n"
+        )
+        with mock.patch.object(bridge, "capture", return_value=pane):
+            block = bridge.extract_pending_dialog("any")
+        self.assertIn("Apply this change?", block)
+        self.assertIn("1. Allow once", block)
+        self.assertIn("4. No, suggest changes", block)
+
+    def test_finds_allow_execution(self):
+        pane = (
+            "  Allow execution of [python3]?\n"
+            "\n"
+            "  ● 1. Allow once\n"
+            "    2. Allow for this session\n"
+            "    3. No, suggest changes (esc)\n"
+        )
+        with mock.patch.object(bridge, "capture", return_value=pane):
+            block = bridge.extract_pending_dialog("any")
+        self.assertIn("Allow execution", block)
+        self.assertIn("1. Allow once", block)
+
+    def test_returns_most_recent_when_multiple(self):
+        # An earlier (already-answered) dialog plus a fresh one.
+        pane = (
+            "  Allow execution of [chmod]?\n"
+            "  ● 1. Allow once\n"
+            "    2. Allow for this session\n"
+            "  Done\n"
+            "\n"
+            "  Apply this change?\n"
+            "  ● 1. Allow once\n"
+            "    2. Allow for this session\n"
+        )
+        with mock.patch.object(bridge, "capture", return_value=pane):
+            block = bridge.extract_pending_dialog("any")
+        self.assertIn("Apply this change?", block)
+        self.assertNotIn("[chmod]", block)
+
+
+class PaneTailAfterUserInputTests(unittest.TestCase):
+    """pane_tail_after_user_input slices from the user's last echoed input."""
+
+    def test_returns_empty_when_input_not_in_pane(self):
+        with mock.patch.object(bridge, "capture", return_value="other content"):
+            self.assertEqual(
+                bridge.pane_tail_after_user_input("any", "hello"), "")
+
+    def test_returns_only_content_after_user_echo(self):
+        pane = (
+            "OLD STALE RESPONSE FROM PREVIOUS TURN\n"
+            "more old content\n"
+            " > make a new script\n"
+            "  Working on it...\n"
+            "  Generated script.sh\n"
+            "  Done\n"
+        )
+        with mock.patch.object(bridge, "capture", return_value=pane):
+            out = bridge.pane_tail_after_user_input(
+                "any", "make a new script",
+                max_lines=20)
+        # Old content above the user echo is excluded.
+        self.assertNotIn("OLD STALE RESPONSE", out)
+        self.assertNotIn("more old content", out)
+        # New content below is included.
+        self.assertIn("Working on it", out)
+        self.assertIn("Generated script.sh", out)
+
+    def test_caps_at_max_lines(self):
+        # 50 fresh lines after the user echo, max_lines=10 → only last 10.
+        pane = " > my prompt\n" + "\n".join(f"line {i}" for i in range(50)) + "\n"
+        with mock.patch.object(bridge, "capture", return_value=pane):
+            out = bridge.pane_tail_after_user_input("any", "my prompt", max_lines=10)
+        self.assertEqual(len(out.split("\n")), 10)
+        self.assertIn("line 49", out)
+        self.assertNotIn("line 39", out)
+
+    def test_strips_via_clean_output(self):
+        pane = " > the prompt\n\x1b[31mcolor\x1b[0m\n│  ╭───╮\nplain text\n"
+        with mock.patch.object(bridge, "capture", return_value=pane):
+            out = bridge.pane_tail_after_user_input("any", "the prompt")
+        self.assertNotIn("\x1b[", out)
+        self.assertNotIn("╭", out)
+        self.assertIn("color", out)
+        self.assertIn("plain text", out)
+
+    def test_strips_gemini_tui_chrome(self):
+        # Regression: when gemini is in shell mode and produces no real
+        # response, we used to dump the whole TUI frame ("? for shortcuts",
+        # ▄▄▄, "! Type your shell command", workspace footer, etc) at the
+        # user. Those should all be stripped.
+        pane = (
+            " > my prompt\n"
+            "                                                          ? for shortcuts\n"
+            "  shell mode enabled (esc to disable)\n"
+            "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            " !   Type your shell command\n"
+            " workspace (/directory)        branch    sandbox    /model    quota\n"
+            " /home/kurnianto/code/CCTV     main      no sandbox Auto (Gemini 3)  2% used\n"
+            "real progress line we want to see\n"
+        )
+        with mock.patch.object(bridge, "capture", return_value=pane):
+            out = bridge.pane_tail_after_user_input("any", "my prompt", max_lines=20)
+        self.assertNotIn("? for shortcuts", out)
+        self.assertNotIn("shell mode enabled", out)
+        self.assertNotIn("Type your shell command", out)
+        self.assertNotIn("workspace (/directory)", out)
+        self.assertNotIn("Auto (Gemini", out)
+        # ▄ should be eaten by BOX_RE inside clean_output.
+        self.assertNotIn("▄", out)
+        self.assertIn("real progress line", out)
+
+
+# ---- dispatcher: three-tier fallback flow -----------------------------------
+
+class DispatcherFallbackTests(unittest.TestCase):
+    """When send_and_wait returns "", the dispatcher should:
+       1. Surface a pending permission dialog if there is one.
+       2. Otherwise show user-anchored recent activity if there is any.
+       3. Otherwise post a "still working" message — never the bottom of the
+          pane (which can be stale)."""
+
+    def setUp(self):
+        self.handle, self.app = fresh_handler()
+
+    def _last_update(self):
+        return self.app.client.updates[-1].get("text", "") if self.app.client.updates else ""
+
+    def test_priority_1_permission_dialog(self):
+        seed_session()
+        with mock.patch.object(bridge, "send_and_wait", return_value=""), \
+             mock.patch.object(bridge, "extract_pending_dialog",
+                               return_value="Apply this change?\n  ● 1. Allow once"), \
+             mock.patch.object(bridge, "pane_tail_after_user_input") as anchored:
+            self.handle("U", "D1", "yes do it", None)
+        # Dialog wins; anchored fallback never runs.
+        anchored.assert_not_called()
+        text = self._last_update()
+        self.assertIn("PERMISSION DIALOG", text)
+        self.assertIn("Apply this change?", text)
+        self.assertIn("1. Allow once", text)
+
+    def test_priority_2_anchored_recent_activity(self):
+        seed_session()
+        with mock.patch.object(bridge, "send_and_wait", return_value=""), \
+             mock.patch.object(bridge, "extract_pending_dialog", return_value=""), \
+             mock.patch.object(bridge, "pane_tail_after_user_input",
+                               return_value="line a\nline b") as anchored:
+            self.handle("U", "D1", "what is the progress", None)
+        anchored.assert_called_once()
+        text = self._last_update()
+        self.assertIn("AGENT STILL RENDERING", text)
+        self.assertIn("line a", text)
+        # No "extracted reply was empty" preamble (old behavior).
+        self.assertNotIn("extracted reply was empty", text)
+
+    def test_priority_3_still_working(self):
+        seed_session()
+        with mock.patch.object(bridge, "send_and_wait", return_value=""), \
+             mock.patch.object(bridge, "extract_pending_dialog", return_value=""), \
+             mock.patch.object(bridge, "pane_tail_after_user_input", return_value=""):
+            self.handle("U", "D1", "anything", None)
+        text = self._last_update()
+        self.assertIn("busy", text)
+        self.assertIn("!cancel", text)
+        self.assertIn("!raw", text)
+
+    def test_normal_response_skips_all_fallbacks(self):
+        seed_session()
+        with mock.patch.object(bridge, "send_and_wait",
+                               return_value="actual reply"), \
+             mock.patch.object(bridge, "extract_pending_dialog") as ed, \
+             mock.patch.object(bridge, "pane_tail_after_user_input") as anchored:
+            self.handle("U", "D1", "hello", None)
+        ed.assert_not_called()
+        anchored.assert_not_called()
+
+
+# ---- empty-reply fallback + !raw -------------------------------------------
+
+# EmptyReplyFallbackTests removed — superseded by DispatcherFallbackTests
+# above, which exercises the new three-tier fallback (dialog → user-anchored
+# tail → still-working). The old single-tier `pane_tail` fallback was the
+# source of the "stale captions table" bug we set out to fix.
+
+
+class RawCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.handle, self.app = fresh_handler()
+
+    def test_no_session(self):
+        self.handle("U", "D1", "!raw", None)
+        self.assertIn("No active session", last_post_text(self.app))
+
+    def test_default_dumps_pane_tail(self):
+        seed_session()
+        sample = "\n".join(f"line {i}" for i in range(10))
+        with mock.patch.object(bridge, "pane_tail", return_value=sample) as pt:
+            self.handle("U", "D1", "!raw", None)
+        pt.assert_called_once()
+        # Default n=60.
+        self.assertEqual(pt.call_args.kwargs.get("n"), 60)
+        text = last_post_text(self.app)
+        self.assertIn("line 0", text)
+        self.assertIn("line 9", text)
+
+    def test_custom_n(self):
+        seed_session()
+        with mock.patch.object(bridge, "pane_tail", return_value="ok") as pt:
+            self.handle("U", "D1", "!raw 5", None)
+        self.assertEqual(pt.call_args.kwargs.get("n"), 5)
+
+    def test_n_is_clamped(self):
+        seed_session()
+        with mock.patch.object(bridge, "pane_tail", return_value="ok") as pt:
+            self.handle("U", "D1", "!raw 99999", None)
+        self.assertEqual(pt.call_args.kwargs.get("n"), 500)
+        with mock.patch.object(bridge, "pane_tail", return_value="ok") as pt:
+            self.handle("U", "D1", "!raw 0", None)
+        self.assertEqual(pt.call_args.kwargs.get("n"), 1)
+
+    def test_invalid_n_shows_usage(self):
+        seed_session()
+        with mock.patch.object(bridge, "pane_tail") as pt:
+            self.handle("U", "D1", "!raw foo", None)
+        pt.assert_not_called()
+        self.assertIn("Usage:", last_post_text(self.app))
+
+    def test_empty_pane_message(self):
+        seed_session()
+        with mock.patch.object(bridge, "pane_tail", return_value=""):
+            self.handle("U", "D1", "!raw", None)
+        self.assertIn("empty after cleanup", last_post_text(self.app))
+
+    def test_aliases(self):
+        seed_session()
+        with mock.patch.object(bridge, "pane_tail", return_value="ok"):
+            for alias in ("!pane", "!tail"):
+                self.app.client.posts.clear()
+                self.handle("U", "D1", alias, None)
+                self.assertIn("ok", last_post_text(self.app))
+
+
+class PaneTailHelperTests(unittest.TestCase):
+    """Helper-level: pane_tail uses capture+clean_output and obeys n."""
+
+    def test_returns_last_n_lines(self):
+        body = "\n".join(f"line{i}" for i in range(100))
+        with mock.patch.object(bridge, "capture", return_value=body):
+            out = bridge.pane_tail("any-session", n=5)
+        self.assertEqual(out.split("\n"), ["line95", "line96", "line97", "line98", "line99"])
+
+    def test_returns_all_when_short(self):
+        body = "a\nb\nc"
+        with mock.patch.object(bridge, "capture", return_value=body):
+            out = bridge.pane_tail("any-session", n=10)
+        self.assertEqual(out, "a\nb\nc")
+
+    def test_strips_ansi_via_clean_output(self):
+        body = "\x1b[31mhello\x1b[0m\n│ ─── \nworld"
+        with mock.patch.object(bridge, "capture", return_value=body):
+            out = bridge.pane_tail("any-session", n=10)
+        self.assertNotIn("\x1b[", out)
+        self.assertIn("hello", out)
+        self.assertIn("world", out)
+
+
+# ---- unknown !command must NOT be forwarded to the CLI ---------------------
+
+class UnknownCommandTests(unittest.TestCase):
+    """Typos like `!session` (singular) must not get typed into the CLI as
+    raw text. Forwarding them flips gemini into shell-mode and bricks the
+    conversation. The bridge should reject and suggest `!help`."""
+
+    def setUp(self):
+        self.handle, self.app = fresh_handler()
+
+    def test_typo_is_not_forwarded(self):
+        seed_session()
+        # send_and_wait must NEVER be called for unknown !commands.
+        with mock.patch.object(bridge, "send_and_wait") as saw:
+            self.handle("U", "D1", "!session", None)  # singular typo
+        saw.assert_not_called()
+        text = last_post_text(self.app)
+        self.assertIn("Unknown bridge command", text)
+        self.assertIn("`!session`", text)
+        self.assertIn("!help", text)
+
+    def test_only_leading_bang_is_intercepted(self):
+        # A message with `!` mid-text (not as the first char) IS forwarded —
+        # users may legitimately want to send "fix the !important flag" to
+        # the CLI without bridge interception.
+        seed_session()
+        with mock.patch.object(bridge, "send_and_wait", return_value="ok") as saw:
+            self.handle("U", "D1", "fix the !important flag", None)
+        saw.assert_called_once()
+
+    def test_known_commands_still_work(self):
+        # Sanity: !sessions, !help, etc. still match their handlers and DON'T
+        # hit the unknown-command refusal.
+        seed_session()
+        self.handle("U", "D1", "!sessions", None)
+        text = last_post_text(self.app)
+        self.assertNotIn("Unknown bridge command", text)
+
+
+# ---- safety: codex must use -a untrusted ------------------------------------
+
+class CodexSafetyConfigTests(unittest.TestCase):
+    """Guards against quietly loosening codex's approval mode.
+
+    `-a on-request` lets the model decide when to ask, which in practice means
+    explicit user phrases like "delete X" can run without a permission dialog
+    being raised — and therefore without the bridge forwarding one to Slack.
+    `-a untrusted` is a deliberate safety choice: only a small allowlist of
+    read-only commands auto-approves; everything else asks. Don't loosen this
+    without thinking through the bridge's "ask in Slack" promise.
+    """
+
+    def test_codex_launched_with_untrusted_approval(self):
+        cmd = bridge.CLI_CONFIGS["codex"]["cmd"]
+        self.assertIn("-a untrusted", cmd,
+                      "codex must run with -a untrusted so model-initiated "
+                      "mutations always ask before executing")
+        self.assertNotIn("-a on-request", cmd)
+        self.assertNotIn("--dangerously", cmd)
+
+    def test_codex_sandboxes_workspace_writes(self):
+        cmd = bridge.CLI_CONFIGS["codex"]["cmd"]
+        self.assertIn("-s workspace-write", cmd,
+                      "codex must run with -s workspace-write so file writes "
+                      "are sandboxed to the session cwd")
 
 
 # ---- existing pure functions: regression ------------------------------------

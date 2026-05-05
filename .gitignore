@@ -10,3 +10,6 @@ output/check_limit/*.txt
 .env
 .env.local
 *.env
+
+# Per-machine Claude Code settings (permissions, hooks). Not for sharing.
+.claude/settings.local.json

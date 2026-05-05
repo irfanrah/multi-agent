@@ -36,6 +36,7 @@ Required Slack scopes (Bot Token):
 
 Subscribe to bot events: app_mention, message.im, message.groups
 """
+import fnmatch
 import glob
 import importlib.util
 import os
@@ -45,9 +46,12 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -71,7 +75,7 @@ _check_limit = None  # lazy-loaded
 # ---- terminal cleanup --------------------------------------------------------
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]")
-BOX_RE = re.compile(r"[│╭╯╰╮─█░▝▘▛▜▟▞▖▗▎▏▬▀▔▁┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬]")
+BOX_RE = re.compile(r"[│╭╯╰╮─█░▝▘▛▜▟▞▖▗▎▏▬▀▄▔▁┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬]")
 SPINNER_CHARS = set("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◑◒◓◴◷◶◵|/-\\")
 PROMPT_PREFIXES = ("›", "❯", ">_", ">>", ">", "•")
 
@@ -127,6 +131,188 @@ def clean_output(text):
     return "\n".join(collapsed).strip()
 
 
+# ---- folder zip (used by !upload) -------------------------------------------
+
+# Skip the usual project junk so a zip of "the project folder" doesn't ship
+# the user's local git history, virtualenvs, or pycache. Excluding by default
+# is opinionated; if a user wanted the .git they can zip externally.
+ZIP_EXCLUDED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".tox", ".mypy_cache", ".pytest_cache"}
+ZIP_EXCLUDED_PATTERNS = ("*.pyc", "*.pyo", ".DS_Store")
+# Pre-check size cap for Slack-direct uploads: matches Slack's bot upload
+# limit. Anything bigger should go via the pixeldrain link path
+# (`!upload --link` or option `2` in the menu), which doesn't hit this cap.
+ZIP_MAX_BYTES = 1024 * 1024 * 1024
+
+
+def _zip_should_skip_file(name):
+    return any(fnmatch.fnmatch(name, p) for p in ZIP_EXCLUDED_PATTERNS)
+
+
+def _walk_for_zip(src_dir):
+    """Yield (full_path, arcname) for files we'd include in the zip.
+
+    `arcname` is relative to a top-level dir matching the src_dir basename, so
+    a recipient extracting `myproj.zip` gets a single `myproj/` folder.
+    """
+    src = os.path.abspath(src_dir)
+    arc_root = os.path.basename(src) or "archive"
+    for root, dirs, files in os.walk(src):
+        # Mutate dirs in place so os.walk skips junk subtrees entirely.
+        dirs[:] = [d for d in dirs if d not in ZIP_EXCLUDED_DIRS]
+        for fname in files:
+            if _zip_should_skip_file(fname):
+                continue
+            full = os.path.join(root, fname)
+            rel = os.path.relpath(full, src)
+            yield full, os.path.join(arc_root, rel)
+
+
+def directory_size_for_zip(src_dir):
+    """Sum file sizes for what _walk_for_zip would include. Cheap pre-check."""
+    total = 0
+    for full, _arc in _walk_for_zip(src_dir):
+        try:
+            total += os.path.getsize(full)
+        except OSError:
+            pass
+    return total
+
+
+def zip_directory(src_dir, dest_zip):
+    """Write a zip of src_dir to dest_zip with deflate compression.
+
+    Files matching ZIP_EXCLUDED_DIRS / ZIP_EXCLUDED_PATTERNS are skipped.
+    Returns the number of files written.
+    """
+    count = 0
+    with zipfile.ZipFile(dest_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+        for full, arc in _walk_for_zip(src_dir):
+            try:
+                zf.write(full, arcname=arc)
+                count += 1
+            except OSError:
+                # Symlink loops, permission errors, etc — skip but don't abort
+                # the whole upload.
+                continue
+    return count
+
+
+# ---- password-protected zip + pixeldrain upload (used by !upload menu) -----
+
+# Always-on password for link-host-bound uploads. Encrypts with classic
+# ZipCrypto (Info-ZIP `-e`); not strong against a determined attacker but
+# enough to gate casual access on top of the link's expiry.
+LINK_UPLOAD_PASSWORD = "!2345678"
+# pixeldrain is the primary public-link host. We previously used transfer.sh
+# but it was unreachable from a user's network — pixeldrain has a similar
+# PUT-style API (`PUT /api/file/<name>` returning JSON `{"id": "..."}`),
+# higher size cap (20 GB), and longer retention (anonymous files keep for
+# ~60 days from last view at the time of writing).
+PIXELDRAIN_ENDPOINT = "https://pixeldrain.com"
+LINK_UPLOAD_TIMEOUT_SEC = 600  # 10 min — uploads of a few hundred MB take time
+
+
+def zip_paths_encrypted(sources, dest_zip, password, base_cwd=None):
+    """Zip the given relative source paths into dest_zip with `zip -e -P`.
+
+    `sources` is a list of paths *relative to* base_cwd; they are passed to
+    `zip` via stdin (`-@`) so we don't blow up the argv length on big trees.
+    Uses the system `zip` binary because Python stdlib zipfile can't write
+    encrypted archives.
+    """
+    if not sources:
+        raise ValueError("no sources to zip")
+    cwd = base_cwd or os.getcwd()
+    proc = subprocess.run(
+        ["zip", "-q", "-e", "-P", password, "-@", dest_zip],
+        input="\n".join(sources),
+        cwd=cwd, text=True, capture_output=True, timeout=600,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"zip failed (rc={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
+        )
+
+
+def make_encrypted_zip_for_upload(source_path, dest_zip, password):
+    """Build a password-protected zip for a file or directory.
+
+    - Folder: includes its tree under <basename>/, skipping ZIP_EXCLUDED_*.
+    - File:   wraps the single file at its basename inside the zip.
+
+    Returns the number of source files included.
+    """
+    src = os.path.abspath(source_path)
+    if os.path.isdir(src):
+        rels = []
+        for full, _arc in _walk_for_zip(src):
+            rels.append(os.path.relpath(full, os.path.dirname(src)))
+        zip_paths_encrypted(rels, dest_zip, password,
+                            base_cwd=os.path.dirname(src))
+        return len(rels)
+    if os.path.isfile(src):
+        zip_paths_encrypted([os.path.basename(src)], dest_zip, password,
+                            base_cwd=os.path.dirname(src))
+        return 1
+    raise FileNotFoundError(src)
+
+
+def pixeldrain_put(file_path, *, endpoint=PIXELDRAIN_ENDPOINT,
+                   timeout=LINK_UPLOAD_TIMEOUT_SEC):
+    """PUT file_path to pixeldrain and return the public download URL.
+
+    pixeldrain returns JSON `{"id": "<id>", "success": true}` on success;
+    the user-facing viewer URL is `<endpoint>/u/<id>`.
+
+    Reads the whole file into memory before sending — fine for the
+    hundreds-of-MB range the bridge is targeted at; for multi-GB we'd
+    switch to a streaming HTTP client.
+    """
+    import json
+    name = os.path.basename(file_path)
+    url = f"{endpoint.rstrip('/')}/api/file/{urllib.parse.quote(name)}"
+    with open(file_path, "rb") as f:
+        body = f.read()
+    req = urllib.request.Request(url, data=body, method="PUT",
+                                 headers={"Content-Type": "application/zip"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="replace").strip()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise RuntimeError(f"pixeldrain returned non-JSON: {raw[:200]}")
+    file_id = data.get("id") or data.get("file_id")
+    if not file_id:
+        raise RuntimeError(f"pixeldrain JSON missing `id`: {data}")
+    return f"{endpoint.rstrip('/')}/u/{file_id}"
+
+
+# ---- pending uploads (powers the !upload 1/2 menu) --------------------------
+
+# Per-channel "I just typed !upload, waiting for you to choose 1 or 2" state.
+# A bare `1` / `2` reply only counts as a menu pick when the channel has a
+# fresh pending entry — otherwise it falls through to the active CLI session
+# (so codex/claude permission dialogs still work).
+pending_uploads: dict = {}
+pending_uploads_lock = threading.Lock()
+PENDING_UPLOAD_TTL_SEC = 120
+
+
+def _gc_pending_uploads(now=None):
+    now = now if now is not None else time.time()
+    with pending_uploads_lock:
+        expired = [k for k, v in pending_uploads.items() if v["expires_at"] < now]
+        for k in expired:
+            pending_uploads.pop(k, None)
+
+
+def _take_pending_upload(channel):
+    """Pop and return the pending upload for `channel`, or None if none/expired."""
+    _gc_pending_uploads()
+    with pending_uploads_lock:
+        return pending_uploads.pop(channel, None)
+
+
 # ---- tmux helpers ------------------------------------------------------------
 
 def _tmux(*args, capture=False):
@@ -144,6 +330,108 @@ def session_exists(name):
 def capture(name):
     """Full capture including scrollback so diffs work after the pane has scrolled."""
     return _tmux("capture-pane", "-pt", name, "-S", "-3000", capture=True).rstrip()
+
+
+def pane_tail(name, n=60):
+    """Last `n` lines of the cleaned pane.
+
+    Used by !raw and as a fallback when send_and_wait's chrome-clipping
+    leaves the response empty (e.g. monitor/streaming commands where the
+    input prompt re-renders below the output and the chrome regex eats
+    everything below it). No chrome clipping here — only the line-level
+    `clean_output` (ANSI/box/spinner/noise stripping).
+    """
+    cleaned = clean_output(capture(name))
+    lines = cleaned.split("\n")
+    if n > 0 and len(lines) > n:
+        cleaned = "\n".join(lines[-n:])
+    return cleaned
+
+
+def pane_tail_after_user_input(name, user_text, max_lines=20):
+    """Cleaned pane content that appears AFTER the user's last echoed input.
+
+    When send_and_wait extracts nothing, the bottom-N-lines fallback
+    (`pane_tail`) often shows stale content because most of the new turn is
+    tool-call chrome that `clean_output` strips, leaving only an older
+    response near the end of the buffer. Anchoring at the user's echoed
+    input means we only show *recent* activity.
+
+    Also strips chrome lines (TUI footer, prompt placeholders, divider runs)
+    via CHROME_DIVIDER_RE so we don't dump the gemini/codex frame back to
+    Slack. Returns "" when nothing meaningful is below the user echo
+    (caller can switch to a "still working" message).
+    """
+    raw = capture(name)
+    raw_no_ansi = ANSI_RE.sub("", raw)
+    if not user_text:
+        return ""
+    idx = raw_no_ansi.rfind(user_text)
+    if idx < 0:
+        return ""
+    eol = raw_no_ansi.find("\n", idx)
+    after = raw_no_ansi[eol + 1:] if eol >= 0 else ""
+    cleaned = clean_output(after)
+    out_lines = []
+    for ln in cleaned.split("\n"):
+        if not ln.strip():
+            continue
+        if CHROME_DIVIDER_RE.match(ln):
+            continue
+        out_lines.append(ln)
+    if max_lines > 0 and len(out_lines) > max_lines:
+        out_lines = out_lines[-max_lines:]
+    return "\n".join(out_lines)
+
+
+def extract_pending_dialog(name, scan_lines=80):
+    """Return the most recent permission dialog block on the pane, or "".
+
+    Scans the last `scan_lines` of the cleaned pane for PERMISSION_DIALOG_RE.
+    If found, returns from the dialog's question line through the dialog
+    footer (DIALOG_END_RE: "Esc to cancel" / "Press enter to confirm" / blank
+    run after the options). Use this BEFORE the bottom-tail fallback so a
+    waiting permission dialog is the actionable message we surface to Slack.
+    """
+    cleaned = clean_output(capture(name))
+    lines = cleaned.split("\n")
+    if scan_lines > 0 and len(lines) > scan_lines:
+        lines = lines[-scan_lines:]
+    # Find the LAST dialog (most recent — earlier ones may already be answered).
+    last_match_line = -1
+    for i, ln in enumerate(lines):
+        if PERMISSION_DIALOG_RE.search(ln):
+            last_match_line = i
+    if last_match_line < 0:
+        return ""
+    # Walk backwards up to N lines to find the question line. Pattern:
+    #   "  Apply this change?"           <- question
+    #   ""                               <- blank (don't stop here)
+    #   "  ● 1. Allow once"              <- regex matched here
+    # Skip blank lines while searching; only anchor on a "?" or a known
+    # dialog header.
+    start = last_match_line
+    back_max = 10
+    for back in range(1, back_max + 1):
+        j = last_match_line - back
+        if j < 0:
+            break
+        ln = lines[j]
+        if "?" in ln or any(w in ln for w in (
+            "Apply this change", "Would you like", "Allow execution",
+            "Do you want", "Allow this",
+        )):
+            start = j
+            break
+    # Walk forwards to the dialog end (footer or blank line after options).
+    end = last_match_line
+    for k in range(last_match_line + 1, len(lines)):
+        ln = lines[k]
+        if DIALOG_END_RE.match(ln) or not ln.strip():
+            break
+        end = k
+    block = "\n".join(lines[start:end + 1])
+    return block.strip()
 
 
 # ---- CLI session lifecycle ---------------------------------------------------
@@ -171,14 +459,17 @@ CLI_CONFIGS = {
     "codex": {
         # `-s workspace-write` sandboxes file writes to the cwd — codex can't
         # touch /etc, /usr, the home dir outside the project, etc.
-        # `-a on-request` (codex's default) lets the model decide when to ask.
-        # In practice it auto-approves reads (find, sort, ls, cat, …) and asks
-        # before non-trivial mutations. We tried `-a untrusted` for stricter
-        # safety but it asks for every read-only command outside ~10 hardcoded
-        # ones — annoying. Workspace-write + on-request is the sweet spot.
+        # `-a untrusted` is a deliberate SAFETY choice: codex auto-approves only
+        # a small allowlist of read-only commands (find, sort, ls, cat, …) and
+        # asks for everything else, including any model-decided `rm` / file
+        # write / shell mutation. The previous setting `-a on-request` let the
+        # model decide when to ask; in practice the model treated explicit user
+        # phrases like "delete X" as authorization and ran without a dialog,
+        # which broke the bridge's promise that destructive actions surface in
+        # Slack. The friction (more prompts) is the intended cost.
         # NOTE: do NOT add --no-alt-screen — codex v0.114.0 ignores stdin
         # written by tmux send-keys when in inline mode.
-        "cmd": "codex -s workspace-write -a on-request",
+        "cmd": "codex -s workspace-write -a untrusted",
         "ready_marker": "›",
         "assistant_marker": "•",
         "display_name": "CLI Bridge — Codex",
@@ -312,6 +603,15 @@ def start_named_session(cli, name, path, inviter_user, app):
     # tmux session name == channel name. Channel names already conform to
     # [a-z0-9_-] (see _slugify_channel), which tmux accepts cleanly.
     tmux_name = final_name
+    # Register the CLISession in the global dict BEFORE the long tmux startup
+    # blocks. Without this, a `!sessions` typed in the agent channel during
+    # the 30–90s gemini/codex boot returns "No active sessions" because the
+    # record hasn't been added yet. On startup failure we pop it back out.
+    with sessions_lock:
+        sessions[channel_id] = CLISession(
+            cli=cli, tmux_name=tmux_name, path=path,
+            slack_channel_id=channel_id, is_named=True,
+        )
     # 90s instead of 30s — snap apps (gemini, codex) can be slow to start under
     # memory/CPU pressure. If we timeout, capture the pane to help diagnose.
     if not start_session(cli, tmux_name, cwd=path, max_wait=90):
@@ -320,6 +620,8 @@ def start_named_session(cli, name, path, inviter_user, app):
         except Exception:
             tail = "(capture failed)"
         kill_session(tmux_name)
+        with sessions_lock:
+            sessions.pop(channel_id, None)
         try:
             app.client.conversations_archive(channel=channel_id)
         except SlackApiError:
@@ -344,7 +646,11 @@ CHROME_DIVIDER_RE = re.compile(
     r"|^▄{3,}\s*$"                       # Gemini box top
     r"|^▀{3,}\s*$"                       # Gemini box bottom
     r"|^\s*Shift\+Tab to accept edits\s*$"
+    r"|^\s*shell mode enabled.*$"        # Gemini shell-mode banner
+    r"|^\s*workspace\s+\(/directory\).*$"  # Gemini footer header row
+    r"|^\s*[!>]\s+Type your\s+(?:shell command|message).*$"  # Gemini input placeholders
     r"|^.*\d+%\s+left\b.*$"              # Codex footer: "gpt-X · N% left · /path"
+    r"|^.*Auto\s+\(Gemini\s+\d+\).*\d+%\s+used\s*$"  # Gemini footer values row
     r"|^\s*›\s+(?!\d+\.)"                # Codex input placeholder ("› Explain this codebase")
                                           # — but NOT dialog options like "› 1. Yes"
     r"|^\s*❯\s*$",                       # Claude empty input prompt
@@ -357,8 +663,9 @@ CHROME_DIVIDER_RE = re.compile(
 PERMISSION_DIALOG_RE = re.compile(
     r"Do you want to proceed\?"
     r"|Would you like to run"
-    r"|Allow this (?:action|command|tool)"
-    r"|[›❯]\s*\d+\.\s*(?:Yes|Allow|Trust|Approve)"
+    r"|Allow (?:this|execution of)"             # codex / gemini "Allow execution of [...]?"
+    r"|Apply this change\?"                     # gemini edit-tool dialog
+    r"|[›❯●•✦]\s*\d+\.\s*(?:Yes|Allow|Trust|Approve|Modify|No)"
     r"|\[\s*[yY]\s*/\s*[nN]\s*\]",
     re.IGNORECASE,
 )
@@ -667,6 +974,151 @@ def make_handler(app):
             return app.client.chat_postMessage(channel=channel, text=text,
                                                blocks=blocks if blocks is not None else None)
 
+    def _post_upload_summary(channel, uploaded, failed, thread_ts):
+        lines = []
+        if uploaded:
+            lines.append(f":outbox_tray: Uploaded {len(uploaded)} file(s).")
+        if failed:
+            lines.append("Issues:\n  • " + "\n  • ".join(failed))
+        if not lines:
+            lines.append("Nothing to upload.")
+        post(channel, "\n".join(lines), thread_ts)
+
+    def _run_direct_uploads(channel, resolved, thread_ts=None):
+        """Direct-to-Slack flow: file → as-is, folder → zip (junk excluded)."""
+        uploaded, failed = [], []
+        scope_failure = False
+        for path in resolved[:20]:
+            if scope_failure:
+                break
+            if os.path.isdir(path):
+                base_name = os.path.basename(os.path.abspath(path)) or "archive"
+                pre_size = directory_size_for_zip(path)
+                if pre_size > ZIP_MAX_BYTES:
+                    mb = pre_size / (1024 * 1024)
+                    cap_mb = ZIP_MAX_BYTES / (1024 * 1024)
+                    failed.append(
+                        f"`{base_name}/` ({mb:.0f} MB after excluding junk > "
+                        f"{cap_mb:.0f} MB Slack cap; use `!upload --link {path}` "
+                        f"to send via pixeldrain instead)"
+                    )
+                    continue
+                tf = tempfile.NamedTemporaryFile(
+                    suffix=".zip", prefix="slack_upload_", delete=False)
+                tf.close()
+                zip_path = tf.name
+                try:
+                    nfiles = zip_directory(path, zip_path)
+                    if nfiles == 0:
+                        failed.append(f"`{base_name}/` (no files to zip after exclusions)")
+                        continue
+                    try:
+                        app.client.files_upload_v2(
+                            channel=channel, file=zip_path,
+                            title=f"{base_name}.zip",
+                        )
+                        uploaded.append(f"{base_name}.zip ({nfiles} files)")
+                    except SlackApiError as e:
+                        err = e.response.get("error", "?")
+                        if err == "missing_scope":
+                            failed.append(
+                                f"`{base_name}.zip` — bot needs `files:write` "
+                                "scope; add it in OAuth & Permissions and reinstall.")
+                            scope_failure = True
+                        else:
+                            failed.append(f"`{base_name}.zip` ({err})")
+                except Exception as e:
+                    failed.append(f"`{base_name}/` (zip error: {e})")
+                finally:
+                    try:
+                        os.remove(zip_path)
+                    except OSError:
+                        pass
+                continue
+            if not os.path.isfile(path):
+                failed.append(f"`{path}` (not found)")
+                continue
+            try:
+                app.client.files_upload_v2(
+                    channel=channel, file=path,
+                    title=os.path.basename(path),
+                )
+                uploaded.append(os.path.basename(path))
+            except SlackApiError as e:
+                err = e.response.get("error", "?")
+                if err == "missing_scope":
+                    failed.append(
+                        f"`{os.path.basename(path)}` — bot needs `files:write` "
+                        "scope; add it in OAuth & Permissions and reinstall.")
+                    scope_failure = True
+                    continue
+                failed.append(f"`{os.path.basename(path)}` ({err})")
+        return uploaded, failed
+
+    def _run_link_upload(channel, source_path, thread_ts):
+        """pixeldrain flow: build a password-protected zip, PUT, post link."""
+        if not (os.path.isfile(source_path) or os.path.isdir(source_path)):
+            post(channel, f":warning: `{source_path}` (not found)", thread_ts)
+            return
+        base = os.path.basename(os.path.abspath(source_path)) or "archive"
+        # Strip a single trailing .zip from the base when wrapping a zip, so
+        # the encrypted wrapper is named `<base>.zip` not `<base>.zip.zip`.
+        if base.lower().endswith(".zip"):
+            base = base[:-4]
+        placeholder = post(channel,
+                           f":lock: Building encrypted zip of `{base}` for pixeldrain…",
+                           thread_ts)
+        ts = placeholder["ts"] if isinstance(placeholder, dict) else None
+        # Use a temp DIRECTORY (not file) so the destination zip path doesn't
+        # exist yet when `zip` opens it — zip treats an empty existing file as
+        # an invalid archive (rc=3 "Zip file structure invalid").
+        tmpdir = tempfile.mkdtemp(prefix=f"slack_link_{base}_")
+        zip_path = os.path.join(tmpdir, f"{base}.zip")
+        try:
+            try:
+                nfiles = make_encrypted_zip_for_upload(
+                    source_path, zip_path, LINK_UPLOAD_PASSWORD)
+            except Exception as e:
+                msg = f":warning: zip failed: `{e}`"
+                if ts:
+                    update(channel, ts, msg)
+                else:
+                    post(channel, msg, thread_ts)
+                return
+            try:
+                size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+            except OSError:
+                size_mb = 0.0
+            up_msg = (f":outbox_tray: Uploading `{base}.zip` ({nfiles} files, "
+                      f"{size_mb:.1f} MB) to pixeldrain…")
+            if ts:
+                update(channel, ts, up_msg)
+            else:
+                post(channel, up_msg, thread_ts)
+            try:
+                link = pixeldrain_put(zip_path)
+            except Exception as e:
+                msg = (f":warning: pixeldrain upload failed: `{e}`. "
+                       f"Try `!upload --direct {source_path}` instead.")
+                if ts:
+                    update(channel, ts, msg)
+                else:
+                    post(channel, msg, thread_ts)
+                return
+            done_msg = (f":link: *{base}.zip* uploaded to pixeldrain\n"
+                        f"  • Link: {link}\n"
+                        f"  • Password: `{LINK_UPLOAD_PASSWORD}`\n"
+                        f"  • {nfiles} files, {size_mb:.1f} MB. "
+                        f"Public download for ~60 days from last view; anyone "
+                        f"with the link can download but needs the password "
+                        f"to extract.")
+            if ts:
+                update(channel, ts, done_msg)
+            else:
+                post(channel, done_msg, thread_ts)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     def handle(user, channel, text, thread_ts, files=None):
         cmd = text.split()[0].lower() if text else ""
 
@@ -694,10 +1146,10 @@ def make_handler(app):
                     return
                 except Exception as e:
                     post(channel, f":warning: {e}", thread_ts); return
-                with sessions_lock:
-                    sessions[ch_id] = CLISession(
-                        cli=cli, tmux_name=tmux_name, path=sess_path,
-                        slack_channel_id=ch_id, is_named=True)
+                # NOTE: the CLISession record is registered inside
+                # start_named_session BEFORE the long tmux boot, so a
+                # `!sessions` typed in the agent channel mid-startup sees
+                # the in-progress session. Don't re-register here.
                 post(channel,
                      f":zap: Created <#{ch_id}|{ch_name}>, invited you, and launched `{cli}` in `{sess_path}`.",
                      thread_ts)
@@ -787,14 +1239,55 @@ def make_handler(app):
                 post(channel, "No active session. Try `!gemini` or `!codex` first.", thread_ts)
             return
 
+        if cmd in ("!raw", "!pane", "!tail"):
+            # Dump the last N lines of the cleaned pane — escape hatch when
+            # send_and_wait's chrome clipping ate something we wanted to see.
+            parts_raw = text.split()
+            n = 60
+            if len(parts_raw) > 1:
+                try:
+                    n = max(1, min(int(parts_raw[1]), 500))
+                except ValueError:
+                    post(channel,
+                         "Usage: `!raw [N]` — last N lines of the cleaned pane "
+                         "(default 60, max 500).",
+                         thread_ts)
+                    return
+            with sessions_lock:
+                sess = sessions.get(channel)
+            if not sess:
+                post(channel, "No active session.", thread_ts)
+                return
+            tail = pane_tail(sess.tmux_name, n=n)
+            if not tail.strip():
+                post(channel, "_(pane is empty after cleanup)_", thread_ts)
+                return
+            post(channel, _format_for_slack(tail), thread_ts)
+            return
+
         if cmd in ("!upload", "!file", "!files"):
-            # Upload local file(s) to this Slack channel. Relative paths are
-            # resolved against the active session's cwd; globs are expanded.
-            parts = text.split()[1:]
+            # Upload local file(s)/folder(s) to Slack — direct or via pixeldrain.
+            # Relative paths are resolved against the active session's cwd; globs
+            # are expanded. Single-path form prompts the user to pick the
+            # destination unless --direct or --link is given.
+            raw_parts = text.split()[1:]
+            mode = None
+            parts = []
+            for tok in raw_parts:
+                if tok in ("--direct", "--slack"):
+                    mode = "direct"
+                elif tok in ("--link", "--transfer", "--share"):
+                    mode = "link"
+                else:
+                    parts.append(tok)
             if not parts:
                 post(channel,
-                     "Usage: `!upload <path>` (paths can be absolute, relative "
-                     "to session cwd, or globs). Multiple paths allowed.",
+                     "Usage: `!upload <path>` (file, folder, or glob). "
+                     "Single-path form will prompt you to pick:\n"
+                     "  `1` — direct to Slack (folder is zipped, no password)\n"
+                     "  `2` — pixeldrain (zipped + password `!2345678`, public link, ~60d)\n"
+                     "Skip the prompt with `!upload --direct <path>` or "
+                     "`!upload --link <path>`. Multiple paths always go direct.",
                      thread_ts)
                 return
             with sessions_lock:
@@ -802,41 +1295,81 @@ def make_handler(app):
             base = sess.path if (sess and sess.path) else os.getcwd()
             resolved = []
             for p in parts:
-                # Resolve relative paths against session cwd, then glob.
                 full = p if os.path.isabs(p) else os.path.join(base, p)
                 matches = glob.glob(full)
                 if matches:
                     resolved.extend(matches)
                 else:
                     resolved.append(full)  # so we can report it as missing
-            uploaded, failed = [], []
-            for path in resolved[:20]:  # cap so a stray * doesn't spam Slack
-                if not os.path.isfile(path):
-                    failed.append(f"`{path}` (not found)")
-                    continue
-                try:
-                    app.client.files_upload_v2(
-                        channel=channel, file=path,
-                        title=os.path.basename(path),
-                    )
-                    uploaded.append(os.path.basename(path))
-                except SlackApiError as e:
-                    err = e.response.get("error", "?")
-                    if err == "missing_scope":
-                        failed.append(
-                            f"`{os.path.basename(path)}` — bot needs `files:write` "
-                            "scope; add it in OAuth & Permissions and reinstall.")
-                        break  # no point retrying others with same error
-                    failed.append(f"`{os.path.basename(path)}` ({err})")
-            lines = []
-            if uploaded:
-                lines.append(f":outbox_tray: Uploaded {len(uploaded)} file(s).")
-            if failed:
-                lines.append("Issues:\n  • " + "\n  • ".join(failed))
-            if not lines:
-                lines.append("Nothing to upload.")
-            post(channel, "\n".join(lines), thread_ts)
+
+            single = len(resolved) == 1 and (
+                os.path.isfile(resolved[0]) or os.path.isdir(resolved[0])
+            )
+            if mode is None and single:
+                # Stash pending state and prompt with a 1/2 menu.
+                src = resolved[0]
+                kind = "folder" if os.path.isdir(src) else "file"
+                size_note = ""
+                if kind == "folder":
+                    sz = directory_size_for_zip(src) / (1024 * 1024)
+                    size_note = f" ({sz:.0f} MB after excluding junk)"
+                else:
+                    try:
+                        size_note = f" ({os.path.getsize(src) / (1024 * 1024):.1f} MB)"
+                    except OSError:
+                        pass
+                with pending_uploads_lock:
+                    pending_uploads[channel] = {
+                        "source": src,
+                        "expires_at": time.time() + PENDING_UPLOAD_TTL_SEC,
+                    }
+                post(channel,
+                     f":file_folder: Upload `{os.path.basename(src) or src}` "
+                     f"({kind}){size_note}?\n"
+                     f"  `1` — direct to Slack (no password, Slack 1 GB cap)\n"
+                     f"  `2` — pixeldrain (encrypted zip, password `{LINK_UPLOAD_PASSWORD}`, "
+                     f"public link ~60d from last view)\n"
+                     f"_Reply `1` or `2` within {PENDING_UPLOAD_TTL_SEC // 60} min "
+                     f"(or `!1` / `!2` if a CLI dialog is open). The pending pick "
+                     f"falls through to the CLI session otherwise._",
+                     thread_ts)
+                return
+
+            if mode == "link":
+                if len(resolved) != 1 or not (
+                    os.path.isfile(resolved[0]) or os.path.isdir(resolved[0])
+                ):
+                    post(channel,
+                         ":warning: `!upload --link` needs exactly one existing "
+                         "file or folder.", thread_ts)
+                    return
+                _run_link_upload(channel, resolved[0], thread_ts)
+                return
+
+            # mode == "direct" or multi-path or single-path-not-found:
+            # run the direct-Slack flow.
+            uploaded, failed = _run_direct_uploads(channel, resolved, thread_ts=thread_ts)
+            _post_upload_summary(channel, uploaded, failed, thread_ts)
             return
+
+        if cmd in ("!1", "!2") or (text.strip() in ("1", "2")):
+            # Pending !upload menu pick. Only fires if the channel has a pending
+            # entry; otherwise falls through to the CLI session forwarding below
+            # so codex/claude permission dialogs that say "1. Yes / 2. No" still
+            # work normally.
+            pick = text.strip().lstrip("!")
+            if pick in ("1", "2"):
+                pending = _take_pending_upload(channel)
+                if pending is not None:
+                    src = pending["source"]
+                    if pick == "1":
+                        uploaded, failed = _run_direct_uploads(
+                            channel, [src], thread_ts=thread_ts)
+                        _post_upload_summary(channel, uploaded, failed, thread_ts)
+                    else:
+                        _run_link_upload(channel, src, thread_ts)
+                    return
+                # No pending — fall through to whatever else (CLI session).
 
         if cmd in ("!kill-server", "!killserver", "!nuke"):
             # Wipe everything: kill the entire tmux server (all bridge sessions),
@@ -1083,26 +1616,52 @@ def make_handler(app):
                  "*Files & shell*\n"
                  "`!run <cmd>` — run a shell command in the session's cwd (30s timeout). "
                  "Token-free way to peek at state (`!run git status`, `!run ls`).\n"
-                 "`!upload <path>` — upload local file(s) to this channel. "
-                 "Paths can be absolute, relative to session cwd, or globs (e.g. "
-                 "`!upload assets/*.png`).\n"
+                 "`!upload <path>` — upload local file(s) or folder(s). "
+                 "Single-path form prompts you to pick:\n"
+                 "    `1` — direct to Slack (folder zipped, no password, "
+                 "junk like `.git`/`__pycache__`/`node_modules`/`.venv`/`*.pyc` excluded)\n"
+                 "    `2` — pixeldrain (encrypted zip with password "
+                 f"`{LINK_UPLOAD_PASSWORD}`, public link ~60 days from last "
+                 f"view, no Slack size cap)\n"
+                 "Skip the prompt with `!upload --direct <path>` or "
+                 "`!upload --link <path>`. Multiple paths or globs always go direct.\n"
                  "`!download` (alias `!dl`) — attach a file to your message + include "
                  "`!download` to save it into the session's cwd. Useful for sharing "
                  "screenshots or PDFs with the agent.\n"
                  "\n"
                  "*Other*\n"
                  "`!sessions` (alias `!ls`) — list every active bridge session globally\n"
+                 "`!raw [N]` (alias `!pane`, `!tail`) — dump the last N lines of the "
+                 "cleaned tmux pane (default 60, max 500). Useful when a streaming/"
+                 "monitor command's output got clipped to `(no output)`.\n"
                  "`!check_limit` — usage % for Claude, Gemini, Codex with reset times\n"
                  "`!kill-server` — `tmux kill-server`: wipe ALL bridge sessions and "
                  "archive their channels. Use when sessions are stuck or you want a "
                  "clean slate.\n"
                  "`!help` — this message\n"
                  "\n"
-                 "*Safety:* agents run with workspace-write sandboxes and *ask before* "
-                 "risky actions (deletes, shell, network). The bridge can't auto-answer "
-                 "those — you do, in Slack. `!run` is local shell; mind what you type.\n"
+                 "*Safety:* every CLI is launched in a stricter mode where any "
+                 "model-initiated mutation (file write, delete, shell command outside "
+                 "a tiny read-only allowlist) triggers a permission dialog that the "
+                 "bridge forwards here — even when the model thinks you authorized it. "
+                 "Reply with the option number (`1`, `2`, …) or `y` / `n` to decide. "
+                 "`!run` is *local* shell on the host; mind what you type — it does "
+                 "NOT go through any agent approval.\n"
                  "*Lifetime:* sessions persist until you `!end` / `!reset` / `!kill-server` "
                  "(no idle timeout).",
+                 thread_ts)
+            return
+
+        # Unknown bridge command — refuse to forward. Otherwise a typo like
+        # `!session` (singular) would be typed into the active CLI as raw
+        # text, which on gemini flips it into shell-mode and breaks every
+        # subsequent free-text message until the user notices and !cancels.
+        if cmd.startswith("!"):
+            post(channel,
+                 f"Unknown bridge command `{cmd}`. Try `!help` for the full "
+                 f"list. (If you really meant to send `{cmd}` to the CLI, "
+                 f"prefix it with a space — the bridge only intercepts `!` "
+                 f"at the very start of the message.)",
                  thread_ts)
             return
 
@@ -1128,6 +1687,44 @@ def make_handler(app):
                 update(channel, ts, f":warning: Error: `{e}`")
                 return
             sess.last_used = time.time()
+            # Three-tier fallback when send_and_wait's chrome clipping leaves
+            # the response empty (common during long tool-call sequences where
+            # the new turn's content is mostly tool-call chrome that
+            # clean_output strips). Captured under the io_lock because the
+            # tmux pane is shared state for the session.
+            #
+            #   1. Permission dialog waiting? Surface it — the user can't
+            #      proceed without answering, so it's the actionable message.
+            #   2. Otherwise anchor a tail at the user's last echoed input;
+            #      shows recent activity instead of stale content above.
+            #   3. Otherwise tell them the agent is still working — don't
+            #      dump the bottom of the pane (it's frequently a stale
+            #      previous response).
+            if not response.strip():
+                dialog = extract_pending_dialog(sess.tmux_name)
+                if dialog:
+                    # _format_for_slack will wrap the whole thing in a code
+                    # block when it sees newlines, so we put the header inside
+                    # too — don't add inner fences (would double-wrap).
+                    response = (
+                        f"PERMISSION DIALOG ({sess.cli}) — reply with the "
+                        f"option (!1, !2, …):\n\n{dialog}"
+                    )
+                else:
+                    recent = pane_tail_after_user_input(
+                        sess.tmux_name, text, max_lines=20)
+                    if recent.strip():
+                        response = (
+                            f"AGENT STILL RENDERING ({sess.cli}) — recent "
+                            f"activity:\n\n{recent}"
+                        )
+                    else:
+                        # Single-line short → not auto-wrapped → backticks
+                        # render as inline code in Slack.
+                        response = (
+                            f":hourglass_flowing_sand: `{sess.cli}` busy; "
+                            f"`!cancel` to abort or `!raw 60` to peek."
+                        )
 
         update(channel, ts, _format_for_slack(response))
 
@@ -1165,10 +1762,28 @@ def main():
     app = App(token=bot_token)
     handle = make_handler(app)
 
+    # Identify our own bot's user id so we can skip its own messages without
+    # also skipping user-token-posted messages (Slack tags any message that
+    # comes through this OAuth app — including xoxp- posts via the user
+    # token — with bot_id, so filtering on `bot_id` alone drops legitimate
+    # user messages).
+    try:
+        BRIDGE_BOT_USER_ID = app.client.auth_test()["user_id"]
+        print(f"Bridge bot user id: {BRIDGE_BOT_USER_ID}")
+    except Exception as e:
+        print(f"warning: auth_test failed: {e}; falling back to bot_id filter")
+        BRIDGE_BOT_USER_ID = None
+
     @app.event("message")
     def on_message(event, logger):
-        if event.get("bot_id"):
+        # Skip our own bot's posts — filter by user id, not by bot_id
+        # presence. (xoxp- user-token posts ALSO carry bot_id because they
+        # go through this app's OAuth.)
+        author_user = event.get("user")
+        if BRIDGE_BOT_USER_ID and author_user == BRIDGE_BOT_USER_ID:
             return
+        if BRIDGE_BOT_USER_ID is None and event.get("bot_id"):
+            return  # legacy fallback if auth_test failed at startup
         # Allow file_share subtype through — file uploads land as messages with
         # subtype="file_share" (legacy) or no subtype but with a `files` array
         # (modern). Skip other subtypes (channel joins, edits, etc).
