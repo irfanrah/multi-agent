@@ -57,3 +57,35 @@ be on `$PATH`.
 Raw `tmux capture-pane` output from `check_limit/main.py` is written to
 `output/check_limit/{claude,gemini,codex}_output.txt`. These contain
 account email, session IDs, and absolute paths, so they're gitignored.
+
+## Tests
+
+Three layers, increasing fidelity and cost — see
+[`docs/slack_bridge.md`](./slack_bridge.md#testing) for full details.
+
+```bash
+python3 -m unittest tests.test_handlers -v        # ~95 unit tests, <1s
+python3 tests/sim_user.py                          # in-process, real tmux + gemini, ~30s
+python3 tests/slack_drive.py --cli gemini --skip-roundtrip   # real Slack drive
+```
+
+`tests/slack_drive.py` posts as you (via `SLACK_USER_TOKEN` in `.env`)
+into a fresh `#<cli>-test_<timestamp>` private channel and walks the full
+test plan. Auto-archives at the end. Useful for verifying
+Slack-API-layer behavior the in-process sim can't catch.
+
+## Bridge robustness
+
+The bridge survives bridge restarts and socket blips via two recovery
+paths (see [Recovery from bridge state loss](./slack_bridge.md#recovery-from-bridge-state-loss)):
+
+- **Auto-relink** — on a free-text message in a channel with no in-memory
+  session, the bridge looks up the channel name, matches against the
+  named-channel pattern (`<cli>-<slug>-<uniqid>`), and re-attaches to a
+  still-live tmux session of the same name. Silent recovery.
+- **Socket watchdog** — repeated `Failed to check the state of sock`
+  errors trigger `os._exit(1)` so an external supervisor can bring up
+  a fresh process. Auto-relink heals state mid-flight.
+
+Use `!debug` in any channel to see the bridge's pid, uptime, in-memory
+sessions dict, and any orphan tmux sessions.
