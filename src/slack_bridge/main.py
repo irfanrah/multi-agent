@@ -295,20 +295,59 @@ def make_encrypted_zip_for_upload(source_path, dest_zip, password):
     raise FileNotFoundError(src)
 
 
-def pixeldrain_put(file_path, *, endpoint=PIXELDRAIN_ENDPOINT,
-                   timeout=LINK_UPLOAD_TIMEOUT_SEC):
-    """PUT file_path to pixeldrain and return the public download URL.
+def _build_multipart(fields, file_field, filename, file_bytes,
+                     file_content_type="application/zip"):
+    """Construct a multipart/form-data body. Returns (content_type, body).
+    `fields` = ordered list of (name, value) string pairs (sent before file).
+    """
+    boundary = "----LINKUPLOADBOUNDARY" + secrets.token_hex(8)
+    parts = []
+    for k, v in fields:
+        parts.append(
+            (f"--{boundary}\r\n"
+             f'Content-Disposition: form-data; name="{k}"\r\n\r\n'
+             f"{v}\r\n").encode())
+    parts.append(
+        (f"--{boundary}\r\n"
+         f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'
+         f"Content-Type: {file_content_type}\r\n\r\n").encode())
+    parts.append(file_bytes)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    return (f"multipart/form-data; boundary={boundary}", b"".join(parts))
 
-    pixeldrain returns JSON `{"id": "<id>", "success": true}` on success;
-    the user-facing viewer URL is `<endpoint>/u/<id>`.
 
-    Reads the whole file into memory before sending — fine for the
-    hundreds-of-MB range the bridge is targeted at; for multi-GB we'd
-    switch to a streaming HTTP client.
+def _upload_pixeldrain_post(file_path, *, timeout):
+    """POST multipart to pixeldrain. Returns viewer URL on success.
+
+    The PUT-style endpoint (`PUT /api/file/<name>`) hangs from some
+    networks; the multipart POST works in those same environments.
     """
     import json
     name = os.path.basename(file_path)
-    url = f"{endpoint.rstrip('/')}/api/file/{urllib.parse.quote(name)}"
+    with open(file_path, "rb") as f:
+        body_bytes = f.read()
+    ctype, body = _build_multipart([], "file", name, body_bytes)
+    req = urllib.request.Request(
+        f"{PIXELDRAIN_ENDPOINT}/api/file",
+        data=body, method="POST",
+        headers={"Content-Type": ctype})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="replace").strip()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise RuntimeError(f"pixeldrain (POST) non-JSON: {raw[:200]}")
+    file_id = data.get("id") or data.get("file_id")
+    if not file_id:
+        raise RuntimeError(f"pixeldrain (POST) JSON missing id: {data}")
+    return f"{PIXELDRAIN_ENDPOINT}/u/{file_id}"
+
+
+def _upload_pixeldrain_put(file_path, *, timeout):
+    """PUT raw body to pixeldrain. Returns viewer URL on success."""
+    import json
+    name = os.path.basename(file_path)
+    url = f"{PIXELDRAIN_ENDPOINT}/api/file/{urllib.parse.quote(name)}"
     with open(file_path, "rb") as f:
         body = f.read()
     req = urllib.request.Request(url, data=body, method="PUT",
@@ -318,11 +357,108 @@ def pixeldrain_put(file_path, *, endpoint=PIXELDRAIN_ENDPOINT,
     try:
         data = json.loads(raw)
     except ValueError:
-        raise RuntimeError(f"pixeldrain returned non-JSON: {raw[:200]}")
+        raise RuntimeError(f"pixeldrain (PUT) non-JSON: {raw[:200]}")
     file_id = data.get("id") or data.get("file_id")
     if not file_id:
-        raise RuntimeError(f"pixeldrain JSON missing `id`: {data}")
-    return f"{endpoint.rstrip('/')}/u/{file_id}"
+        raise RuntimeError(f"pixeldrain (PUT) JSON missing id: {data}")
+    return f"{PIXELDRAIN_ENDPOINT}/u/{file_id}"
+
+
+def _upload_catbox(file_path, *, timeout):
+    """POST multipart to catbox.moe. Returns plain URL string.
+
+    Permanent retention (no auto-expiry), 200 MB hard cap. Anonymous
+    `reqtype=fileupload`. Simplest API of the lot.
+    """
+    name = os.path.basename(file_path)
+    with open(file_path, "rb") as f:
+        body_bytes = f.read()
+    ctype, body = _build_multipart(
+        [("reqtype", "fileupload")],
+        "fileToUpload", name, body_bytes)
+    req = urllib.request.Request(
+        "https://catbox.moe/user/api.php",
+        data=body, method="POST",
+        headers={"Content-Type": ctype})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        link = resp.read().decode("utf-8", errors="replace").strip()
+    if not link.startswith("https://"):
+        raise RuntimeError(f"catbox returned non-URL: {link[:200]}")
+    return link
+
+
+def _upload_0x0(file_path, *, timeout):
+    """POST multipart to 0x0.st. Returns plain URL. ~512 MiB cap.
+
+    0x0.st applies a User-Agent restriction — they reject anonymous-looking
+    UAs to prevent abuse, so we identify as our app explicitly.
+    """
+    name = os.path.basename(file_path)
+    with open(file_path, "rb") as f:
+        body_bytes = f.read()
+    ctype, body = _build_multipart([], "file", name, body_bytes)
+    req = urllib.request.Request(
+        "https://0x0.st",
+        data=body, method="POST",
+        headers={"Content-Type": ctype, "User-Agent": "slack-bridge/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        link = resp.read().decode("utf-8", errors="replace").strip()
+    if not link.startswith("http"):
+        raise RuntimeError(f"0x0.st returned non-URL: {link[:200]}")
+    return link
+
+
+# Ordered fallback chain for the !upload --link path.
+#   pixeldrain-post — works where PUT hangs; biggest size cap (20 GB);
+#                     ~60d retention; viewer URL.
+#   catbox          — simplest API, permanent retention, 200 MB cap.
+#   0x0             — multipart POST, plain URL, ~512 MiB cap, retention by size.
+#   pixeldrain-put  — original API, kept as last resort.
+# Override default order with the `LINK_UPLOAD_HOSTS` env var
+# (comma-separated host names from the dict below).
+_LINK_UPLOADERS = {
+    "pixeldrain-post": _upload_pixeldrain_post,
+    "pixeldrain-put":  _upload_pixeldrain_put,
+    "catbox":          _upload_catbox,
+    "0x0":             _upload_0x0,
+}
+DEFAULT_UPLOADER_ORDER = ["pixeldrain-post", "catbox", "0x0", "pixeldrain-put"]
+PER_HOST_TIMEOUT_SEC = 90  # quickly fall through when one hangs
+
+
+def link_upload(file_path):
+    """Try the configured fallback chain. Returns (host_name, public_url).
+    Raises RuntimeError if every host fails or times out.
+    """
+    env_order = os.environ.get("LINK_UPLOAD_HOSTS", "").strip()
+    order = ([h.strip() for h in env_order.split(",") if h.strip()]
+             if env_order else list(DEFAULT_UPLOADER_ORDER))
+    errors = []
+    for host_name in order:
+        fn = _LINK_UPLOADERS.get(host_name)
+        if not fn:
+            errors.append(f"{host_name}: unknown host")
+            continue
+        try:
+            print(f"[link-upload] trying {host_name}…")
+            link = fn(file_path, timeout=PER_HOST_TIMEOUT_SEC)
+            print(f"[link-upload] {host_name} ok → {link}")
+            return host_name, link
+        except Exception as e:
+            print(f"[link-upload] {host_name} failed: {e}")
+            errors.append(f"{host_name}: {e}")
+    raise RuntimeError("all link-upload hosts failed: " + "; ".join(errors))
+
+
+# Compatibility shim: existing call sites used `pixeldrain_put` directly;
+# point that name at the new fallback chain so callers get retries
+# automatically. Tests mock this name.
+def pixeldrain_put(file_path, *, endpoint=None, timeout=None):  # noqa: ARG001 (compat sig)
+    """Compatibility wrapper — runs the full fallback chain via
+    `link_upload()` and returns just the URL (tests still expect a
+    single URL string)."""
+    _name, url = link_upload(file_path)
+    return url
 
 
 # ---- pending uploads (powers the !upload 1/2 menu) --------------------------
@@ -1157,7 +1293,7 @@ def make_handler(app):
         if base.lower().endswith(".zip"):
             base = base[:-4]
         placeholder = post(channel,
-                           f":lock: Building encrypted zip of `{base}` for pixeldrain…",
+                           f":lock: Building encrypted zip of `{base}` for link upload…",
                            thread_ts)
         ts = placeholder["ts"] if isinstance(placeholder, dict) else None
         # Use a temp DIRECTORY (not file) so the destination zip path doesn't
@@ -1181,28 +1317,39 @@ def make_handler(app):
             except OSError:
                 size_mb = 0.0
             up_msg = (f":outbox_tray: Uploading `{base}.zip` ({nfiles} files, "
-                      f"{size_mb:.1f} MB) to pixeldrain…")
+                      f"{size_mb:.1f} MB) to a public file host "
+                      f"(trying {', '.join(DEFAULT_UPLOADER_ORDER[:3])}…)")
             if ts:
                 update(channel, ts, up_msg)
             else:
                 post(channel, up_msg, thread_ts)
             try:
-                link = pixeldrain_put(zip_path)
+                # link_upload tries the configured fallback chain; the
+                # first host that doesn't time out / error wins.
+                host_name, link = link_upload(zip_path)
             except Exception as e:
-                msg = (f":warning: pixeldrain upload failed: `{e}`. "
-                       f"Try `!upload --direct {source_path}` instead.")
+                msg = (f":warning: every link host failed: `{e}`. "
+                       f"Try `!upload --direct {source_path}` instead, or "
+                       f"set `LINK_UPLOAD_HOSTS` in `.env` to a working host.")
                 if ts:
                     update(channel, ts, msg)
                 else:
                     post(channel, msg, thread_ts)
                 return
-            done_msg = (f":link: *{base}.zip* uploaded to pixeldrain\n"
+            # Per-host retention disclaimer:
+            retention = {
+                "pixeldrain-post": "~60 days from last view",
+                "pixeldrain-put":  "~60 days from last view",
+                "catbox":          "permanent (no auto-expiry)",
+                "0x0":             "retention scales with file size; small files persist longer",
+            }.get(host_name, "see host's policy")
+            done_msg = (f":link: *{base}.zip* uploaded via *{host_name}*\n"
                         f"  • Link: {link}\n"
                         f"  • Password: `{LINK_UPLOAD_PASSWORD}`\n"
                         f"  • {nfiles} files, {size_mb:.1f} MB. "
-                        f"Public download for ~60 days from last view; anyone "
-                        f"with the link can download but needs the password "
-                        f"to extract.")
+                        f"Retention: {retention}. "
+                        f"Anyone with the link can download but needs the "
+                        f"password to extract.")
             if ts:
                 update(channel, ts, done_msg)
             else:
@@ -1432,7 +1579,8 @@ def make_handler(app):
                      "Usage: `!upload <path>` (file, folder, or glob). "
                      "Single-path form will prompt you to pick:\n"
                      "  `1` — direct to Slack (folder is zipped, no password)\n"
-                     f"  `2` — pixeldrain (zipped + password `{LINK_UPLOAD_PASSWORD}`, public link, ~60d)\n"
+                     f"  `2` — public-link host (zipped + password `{LINK_UPLOAD_PASSWORD}`, "
+                     f"tries pixeldrain → catbox → 0x0)\n"
                      "Skip the prompt with `!upload --direct <path>` or "
                      "`!upload --link <path>`. Multiple paths always go direct.",
                      thread_ts)
@@ -1474,8 +1622,9 @@ def make_handler(app):
                      f":file_folder: Upload `{os.path.basename(src) or src}` "
                      f"({kind}){size_note}?\n"
                      f"  `1` — direct to Slack (no password, Slack 1 GB cap)\n"
-                     f"  `2` — pixeldrain (encrypted zip, password `{LINK_UPLOAD_PASSWORD}`, "
-                     f"public link ~60d from last view)\n"
+                     f"  `2` — public-link host (encrypted zip with password "
+                     f"`{LINK_UPLOAD_PASSWORD}`; tries "
+                     f"{' → '.join(DEFAULT_UPLOADER_ORDER[:3])} in order)\n"
                      f"_Reply `1` or `2` within {PENDING_UPLOAD_TTL_SEC // 60} min "
                      f"(or `!1` / `!2` if a CLI dialog is open). The pending pick "
                      f"falls through to the CLI session otherwise._",
@@ -1767,9 +1916,10 @@ def make_handler(app):
                  "Single-path form prompts you to pick:\n"
                  "    `1` — direct to Slack (folder zipped, no password, "
                  "junk like `.git`/`__pycache__`/`node_modules`/`.venv`/`*.pyc` excluded)\n"
-                 "    `2` — pixeldrain (encrypted zip with password "
-                 f"`{LINK_UPLOAD_PASSWORD}`, public link ~60 days from last "
-                 f"view, no Slack size cap)\n"
+                 f"    `2` — public-link host (encrypted zip with password "
+                 f"`{LINK_UPLOAD_PASSWORD}`; tries "
+                 f"{' → '.join(DEFAULT_UPLOADER_ORDER[:3])} in order, "
+                 f"first one that works wins)\n"
                  "Skip the prompt with `!upload --direct <path>` or "
                  "`!upload --link <path>`. Multiple paths or globs always go direct.\n"
                  "`!download` (alias `!dl`) — attach a file to your message + include "
