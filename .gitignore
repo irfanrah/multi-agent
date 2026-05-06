@@ -14,14 +14,3 @@ output/check_limit/*.txt
 # Per-machine Claude Code settings (permissions, hooks). Not for sharing.
 .claude/settings.local.json
 
-# Caption pipeline outputs (multi_agent_caption) — derived data; the
-# captions_*/ directories alone are 3+ GB. Logs and .xlsx are also
-# regenerable from the pipeline. Keep all local.
-output/captions_train/
-output/captions_val/
-output/captions_train.log
-output/captions_val.log
-output/captions_train.xlsx
-output/captions_val.xlsx
-output/codex_last/
-output/test_frames/

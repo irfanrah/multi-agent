@@ -64,10 +64,6 @@ there when you come back tomorrow.
 - **[`check_limit`](./docs/check_limit.md)** — polls each CLI's "show my
   quota" command, parses the panel, prints a one-line summary or draws a
   Tk widget that auto-refreshes.
-- **[`multi_agent_caption`](./docs/multi_agent_caption.md)** — example of
-  using both Gemini and Codex CLIs in parallel from a Python script:
-  caption every video in a dataset with quota-aware fallback across
-  model tiers and full resumability.
 
 Per-component deep dives in [`docs/`](./docs/) ·
 [overview](./docs/overview.md).
@@ -94,8 +90,8 @@ You also need on your `$PATH`:
 
 ## Required environment variables
 
-The bridge and the caption pipeline both load `.env` at module load time.
-Set these in `.env` at the repo root.
+The bridge loads `.env` at module load time. Set these in `.env` at the
+repo root.
 
 | Var | Where to get it | Required? | Used by |
 | --- | --- | --- | --- |
@@ -103,7 +99,6 @@ Set these in `.env` at the repo root.
 | `SLACK_APP_TOKEN` | Slack app → Basic Information → App-Level Tokens (`xapp-…`, scope `connections:write`) | **yes** | bridge (Socket Mode) |
 | `SLACK_USER_TOKEN` | Slack app → OAuth & Permissions → "User OAuth Token" (`xoxp-…`) | optional | `tests/slack_drive.py` only — drives the bridge as a real human via Slack |
 | `LINK_UPLOAD_PASSWORD` | freeform | optional (default `changeme`) | bridge (`!upload --link` zip password) |
-| `MULTI_AGENT_CAPTION_DATASET` | path on your machine | optional (default `<repo>/datasets/videos`) | caption pipeline |
 
 `.env.example` has commented placeholder lines for each. See it for full
 context on the user-token scopes if you intend to run `slack_drive`.
@@ -138,23 +133,24 @@ tokens to `.env`.
 
 ## Running
 
+### Slack bridge (the main thing)
+
+Long-running daemon. One process per Slack workspace.
+
 ```bash
-# Slack bridge (Socket Mode; one process per workspace)
+# Foreground — for testing / first-time bring-up. Logs to stdout.
 python3 src/slack_bridge/main.py
 
-# One-shot CLI usage summary
-python3 src/check_limit/main.py
+# Background — typical deployment. Survives terminal exit.
+nohup python3 -u src/slack_bridge/main.py > /tmp/slack_bridge.log 2>&1 &
 
-# Tk usage widget (auto-refreshes every 6 min)
-python3 src/check_limit/widget.py
-
-# Caption pipeline (long-running, resumable)
-python3 src/multi_agent_caption/main.py
+# Stop a running bridge:
+pgrep -af 'slack_bridge/main\.py' | grep -v grep | awk '{print $1}' | xargs -r kill
 ```
 
-In Slack, after the bridge is running, DM your bot or `@`-mention it in a
-channel to start. Send `!help` for the full command list. Useful starting
-points:
+Once the bridge prints `⚡️ Bolt app is running!`, open Slack: DM the bot
+or `@`-mention it in any channel. Send `!help` for the full command
+list. Useful starting points:
 
 - `!gemini <name> <path>` — create a private agent channel and launch
   gemini with `cwd=<path>` (also `!codex` / `!claude`)
@@ -162,6 +158,18 @@ points:
 - `!debug` — dump bridge state when something looks off
 - `!run <shell-cmd>` — run a shell command in the session's cwd (no agent
   involved, no tokens spent)
+
+### Other tools (standalone, no Slack)
+
+The bridge isn't required for these; they run on their own.
+
+```bash
+# One-shot quota summary across Claude / Gemini / Codex
+python3 src/check_limit/main.py
+
+# Tk desktop widget (auto-refresh every 6 min)
+python3 src/check_limit/widget.py
+```
 
 ## Tests
 
