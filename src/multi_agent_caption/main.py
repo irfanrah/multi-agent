@@ -55,7 +55,36 @@ except Exception:
 
 # Project layout
 _REPO_ROOT = os.path.dirname(_SRC_DIR)
-DATASET = Path("/mnt/nas192/Research_materials/Kur/PIA_clip_dataset/train_val_master_v2")
+
+
+def _load_dotenv():
+    """Populate os.environ from the repo's .env if present. Existing
+    env vars take precedence (`os.environ.setdefault`). Idempotent."""
+    path = os.path.join(_REPO_ROOT, ".env")
+    if not os.path.isfile(path):
+        return
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+_load_dotenv()
+# Dataset root: a directory laid out as <DATASET>/<split>/<class>/*.mp4,
+# where <split> is `train` or `val` and <class> is one of CLASSES below.
+# Override per-machine via the MULTI_AGENT_CAPTION_DATASET env var (read
+# from .env at module load by the slack_bridge package; for direct CLI use
+# of this module, export it in your shell or .env yourself). The default
+# is intentionally a relative placeholder so the pipeline fails fast with a
+# clear "Input dir not found" message rather than crashing on a missing
+# absolute path that varies between users.
+DATASET = Path(os.environ.get(
+    "MULTI_AGENT_CAPTION_DATASET",
+    str(Path(_REPO_ROOT) / "datasets" / "videos"),
+))
 OUT_ROOT = Path(_REPO_ROOT) / "output"
 CLASSES = ["falldown", "fire", "fire_smoke", "normal", "smoke", "violence", "violence_falldown"]
 

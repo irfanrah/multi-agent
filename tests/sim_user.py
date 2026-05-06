@@ -174,7 +174,7 @@ def main():
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
             " !   Type your shell command\n"
             " workspace (/directory)        branch    sandbox    /model    quota\n"
-            " /home/kurnianto/code/CCTV     main      no sandbox Auto (Gemini 3)  2% used\n"
+            " /home/user/code/example      main      no sandbox Auto (Gemini 3)  2% used\n"
             "real progress: writing rename_script.py (line 47/120)\n"
         )
         with mock.patch.object(bridge, "send_and_wait", return_value=""), \

@@ -60,6 +60,35 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.errors import SlackApiError
 
 
+def _load_dotenv():
+    """Load KEY=VALUE pairs from a .env file at the repo root, if present.
+    Existing env vars take precedence (`os.environ.setdefault`).
+
+    Defined and called at module load time so module-level constants
+    (e.g. LINK_UPLOAD_PASSWORD) can read their `.env` overrides before
+    the rest of the bridge boots.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (os.path.join(here, ".env"),
+                      os.path.join(here, "..", "..", ".env")):
+        path = os.path.abspath(candidate)
+        if not os.path.isfile(path):
+            continue
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key, val = key.strip(), val.strip().strip('"').strip("'")
+                os.environ.setdefault(key, val)
+        return path
+    return None
+
+
+_load_dotenv()  # populate os.environ from .env now, before constants below
+
+
 def _load_check_limit():
     """Load src/check_limit/main.py as a distinct module (avoids name collision)."""
     here = os.path.dirname(os.path.abspath(__file__))
@@ -202,7 +231,12 @@ def zip_directory(src_dir, dest_zip):
 # Always-on password for link-host-bound uploads. Encrypts with classic
 # ZipCrypto (Info-ZIP `-e`); not strong against a determined attacker but
 # enough to gate casual access on top of the link's expiry.
-LINK_UPLOAD_PASSWORD = "!2345678"
+# Password applied to every encrypted zip uploaded via the pixeldrain
+# (option `2`) flow. Override per-deployment with the `LINK_UPLOAD_PASSWORD`
+# env var; the default exists only so the bridge runs out-of-the-box. Once
+# you publish anything via this path, anyone with the URL + this password
+# can extract — set your own value if that matters.
+LINK_UPLOAD_PASSWORD = os.environ.get("LINK_UPLOAD_PASSWORD") or "changeme"
 # pixeldrain is the primary public-link host. We previously used transfer.sh
 # but it was unreachable from a user's network — pixeldrain has a similar
 # PUT-style API (`PUT /api/file/<name>` returning JSON `{"id": "..."}`),
@@ -1398,7 +1432,7 @@ def make_handler(app):
                      "Usage: `!upload <path>` (file, folder, or glob). "
                      "Single-path form will prompt you to pick:\n"
                      "  `1` — direct to Slack (folder is zipped, no password)\n"
-                     "  `2` — pixeldrain (zipped + password `!2345678`, public link, ~60d)\n"
+                     f"  `2` — pixeldrain (zipped + password `{LINK_UPLOAD_PASSWORD}`, public link, ~60d)\n"
                      "Skip the prompt with `!upload --direct <path>` or "
                      "`!upload --link <path>`. Multiple paths always go direct.",
                      thread_ts)
@@ -1852,29 +1886,10 @@ def make_handler(app):
     return handle
 
 
-def _load_dotenv():
-    """Load KEY=VALUE pairs from a .env file at the repo root, if present.
-    Existing env vars take precedence."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    for candidate in (os.path.join(here, ".env"),
-                      os.path.join(here, "..", "..", ".env")):
-        path = os.path.abspath(candidate)
-        if not os.path.isfile(path):
-            continue
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, val = line.partition("=")
-                key, val = key.strip(), val.strip().strip('"').strip("'")
-                os.environ.setdefault(key, val)
-        return path
-    return None
-
-
 def main():
-    _load_dotenv()
+    # _load_dotenv() already ran at module load time so module-level
+    # constants (LINK_UPLOAD_PASSWORD etc) could read their overrides.
+    # No need to call it again here.
     bot_token = os.environ.get("SLACK_BOT_TOKEN")
     app_token = os.environ.get("SLACK_APP_TOKEN")
     if not bot_token or not app_token:

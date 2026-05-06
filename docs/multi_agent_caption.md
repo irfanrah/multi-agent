@@ -16,10 +16,13 @@ scraping (`capture_cli_usage`, `parse_gemini_rows`, `parse_codex_rows`). See
 
 ## Inputs / outputs
 
-- **Input:** the dataset at
-  `/mnt/nas192/Research_materials/Kur/PIA_clip_dataset/train_val_master_v2/<split>/<class>/*.mp4`,
-  where `<split>` is `train` or `val` and `<class>` is one of
-  `falldown · fire · fire_smoke · normal · smoke · violence · violence_falldown`.
+- **Input:** a video dataset laid out as
+  `<DATASET>/<split>/<class>/*.mp4`, where `<split>` is `train` or `val`
+  and `<class>` is one of `falldown · fire · fire_smoke · normal · smoke
+  · violence · violence_falldown`. Set the dataset root by exporting
+  `MULTI_AGENT_CAPTION_DATASET=/path/to/dataset` (in your shell or
+  `.env`); the default is `<repo>/datasets/videos/` so the pipeline
+  fails fast with a clear "Input dir not found" if you forget.
 - **Outputs (per split, under `output/`):**
   - `captions_<split>.xlsx` — final spreadsheet (one row per video).
   - `captions_<split>/state.jsonl` — append-only event log (resumable).

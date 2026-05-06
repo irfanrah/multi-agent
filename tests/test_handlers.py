@@ -981,7 +981,7 @@ class PaneTailAfterUserInputTests(unittest.TestCase):
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
             " !   Type your shell command\n"
             " workspace (/directory)        branch    sandbox    /model    quota\n"
-            " /home/kurnianto/code/CCTV     main      no sandbox Auto (Gemini 3)  2% used\n"
+            " /home/user/code/example      main      no sandbox Auto (Gemini 3)  2% used\n"
             "real progress line we want to see\n"
         )
         with mock.patch.object(bridge, "capture", return_value=pane):
