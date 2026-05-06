@@ -40,7 +40,7 @@ CLIS = [
         "expected": 2,  # 5h, weekly
     }),
 ]
-REFRESH_MS = 60_000
+REFRESH_MS = 360_000
 MAX_WAIT_SEC = 45
 
 
