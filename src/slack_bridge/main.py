@@ -211,6 +211,10 @@ LINK_UPLOAD_PASSWORD = "!2345678"
 PIXELDRAIN_ENDPOINT = "https://pixeldrain.com"
 LINK_UPLOAD_TIMEOUT_SEC = 600  # 10 min — uploads of a few hundred MB take time
 
+# Set by `main()` once via auth_test; readable by handlers (e.g. !debug,
+# on_message). Stays None if auth_test failed at startup.
+BRIDGE_BOT_USER_ID = None
+
 
 def zip_paths_encrypted(sources, dest_zip, password, base_cwd=None):
     """Zip the given relative source paths into dest_zip with `zip -e -P`.
@@ -633,6 +637,59 @@ def start_named_session(cli, name, path, inviter_user, app):
         )
 
     return channel_id, tmux_name, final_name
+
+
+# Channel-name pattern for an auto-created agent channel:
+# <cli>-<slug>-<4-hex-uniqid>. We use this to recognize that a previously-
+# created channel can be auto-relinked to a still-live tmux session even if
+# the bridge's in-memory `sessions` dict was wiped (e.g. on bridge restart
+# or socket race).
+NAMED_CHANNEL_RE = re.compile(
+    r"^(?P<cli>" + "|".join(re.escape(c) for c in CLI_CONFIGS) + r")"
+    r"-(?P<slug>.+)-(?P<uniqid>[0-9a-f]{4})$"
+)
+
+
+def try_relink_session(channel, app):
+    """If `channel` is an agent channel whose tmux session is still alive,
+    rebuild the in-memory CLISession and return it. Returns None when the
+    channel doesn't match the agent-channel pattern, can't be looked up,
+    or has no live tmux session.
+
+    This is the bridge's recovery path: the tmux session is the source of
+    truth; if it exists, the bridge can pick up where the previous bridge
+    process left off (modulo `path`/`extra_args` which we can't recover —
+    they affect `!run` cwd default and `!reset` flag preservation, both
+    minor).
+    """
+    try:
+        info = app.client.conversations_info(channel=channel)
+    except Exception as e:
+        print(f"[relink] conversations_info({channel}) failed: {e}")
+        return None
+    name = info.get("channel", {}).get("name", "")
+    m = NAMED_CHANNEL_RE.match(name)
+    if not m:
+        return None
+    cli = m.group("cli")
+    if not session_exists(name):
+        # Channel name matches the pattern but no live tmux pane — can't
+        # recover. The user has to !<cli> <name> <path> to start fresh.
+        print(f"[relink] {channel} name={name!r} matches pattern but tmux "
+              f"session is gone; cannot recover")
+        return None
+    sess = CLISession(
+        cli=cli, tmux_name=name, path=None,
+        slack_channel_id=channel, is_named=True,
+    )
+    with sessions_lock:
+        # Race: another thread might have inserted in the meantime.
+        existing = sessions.get(channel)
+        if existing is not None:
+            return existing
+        sessions[channel] = sess
+    print(f"[relink] {channel} → {name!r} ({cli}); recovered from existing tmux")
+    return sess
 
 
 def kill_session(name):
@@ -1239,6 +1296,62 @@ def make_handler(app):
                 post(channel, "No active session. Try `!gemini` or `!codex` first.", thread_ts)
             return
 
+        if cmd == "!debug":
+            # Dump the bridge's internal state — pid, uptime, in-memory
+            # sessions dict, and any orphan tmux sessions matching the
+            # agent-channel pattern. Use this when sessions appear to have
+            # been lost or behavior is unexplained.
+            now = time.time()
+            try:
+                pid = os.getpid()
+                with open(f"/proc/{pid}/stat") as f:
+                    stat = f.read().split()
+                # field 22 (0-indexed 21) is starttime in clock ticks since boot
+                clk_tck = os.sysconf("SC_CLK_TCK")
+                with open("/proc/uptime") as f:
+                    sys_uptime = float(f.read().split()[0])
+                proc_start = sys_uptime - (int(stat[21]) / clk_tck)
+                uptime = int(proc_start)
+            except Exception:
+                pid = os.getpid()
+                uptime = -1
+            lines = [
+                f"*Bridge debug* — pid `{pid}`, uptime `{uptime}s`, "
+                f"bot `<@{BRIDGE_BOT_USER_ID or '?'}>`",
+            ]
+            with sessions_lock:
+                snapshot = list(sessions.items())
+            if snapshot:
+                lines.append(f"\n*In-memory sessions ({len(snapshot)}):*")
+                for ch_id, s in snapshot:
+                    age = int(now - s.last_used)
+                    lines.append(
+                        f"  • `{ch_id}` — `{s.cli}`, "
+                        f"tmux `{s.tmux_name}`, idle {age}s"
+                    )
+            else:
+                lines.append("\n*In-memory sessions:* none")
+            try:
+                tmux_list = subprocess.check_output(
+                    ["tmux", "ls", "-F", "#S"], text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip().split("\n")
+            except subprocess.CalledProcessError:
+                tmux_list = []
+            tracked = {s.tmux_name for _, s in snapshot}
+            orphans = [n for n in tmux_list
+                       if n and NAMED_CHANNEL_RE.match(n) and n not in tracked]
+            if orphans:
+                lines.append(
+                    f"\n*Orphan agent-pattern tmux sessions "
+                    f"(no in-memory record):*")
+                for n in orphans[:20]:
+                    lines.append(f"  • `{n}`")
+                if len(orphans) > 20:
+                    lines.append(f"  • … +{len(orphans) - 20} more")
+            post(channel, "\n".join(lines), thread_ts)
+            return
+
         if cmd in ("!raw", "!pane", "!tail"):
             # Dump the last N lines of the cleaned pane — escape hatch when
             # send_and_wait's chrome clipping ate something we wanted to see.
@@ -1631,6 +1744,9 @@ def make_handler(app):
                  "\n"
                  "*Other*\n"
                  "`!sessions` (alias `!ls`) — list every active bridge session globally\n"
+                 "`!debug` — dump bridge pid, uptime, in-memory sessions, and any "
+                 "orphan tmux sessions matching the agent-channel pattern. Use this "
+                 "when sessions look lost or behavior is unexplained.\n"
                  "`!raw [N]` (alias `!pane`, `!tail`) — dump the last N lines of the "
                  "cleaned tmux pane (default 60, max 500). Useful when a streaming/"
                  "monitor command's output got clipped to `(no output)`.\n"
@@ -1667,6 +1783,11 @@ def make_handler(app):
 
         with sessions_lock:
             sess = sessions.get(channel)
+        if not sess:
+            # Recovery path: maybe this is an agent channel whose tmux
+            # session is still alive but our in-memory record was lost
+            # (bridge restart, socket race). Re-link silently if possible.
+            sess = try_relink_session(channel, app)
         if not sess:
             post(channel, "No active session. Start one with `!gemini`, `!codex`, or `!claude`.", thread_ts)
             return
@@ -1766,7 +1887,8 @@ def main():
     # also skipping user-token-posted messages (Slack tags any message that
     # comes through this OAuth app — including xoxp- posts via the user
     # token — with bot_id, so filtering on `bot_id` alone drops legitimate
-    # user messages).
+    # user messages). Module-global so any handler can read it.
+    global BRIDGE_BOT_USER_ID
     try:
         BRIDGE_BOT_USER_ID = app.client.auth_test()["user_id"]
         print(f"Bridge bot user id: {BRIDGE_BOT_USER_ID}")
@@ -1832,6 +1954,35 @@ def main():
     # / !kill-server (or host restart). To re-enable, uncomment the line below
     # and set IDLE_TIMEOUT_SEC at the top of the file to e.g. 30*60.
     # threading.Thread(target=cleanup_idle_loop, args=(app,), daemon=True).start()
+
+    # Socket-failure watchdog. slack_bolt's Socket Mode auto-reconnects on
+    # transient errors but a degraded connection can leak hours of dropped
+    # events before recovering. We tail the stderr stream of slack_bolt's
+    # logger; if we see >= 5 socket-state failures within 60s, exit so an
+    # external supervisor (systemd, nohup loop, tmux respawn) can bring up
+    # a fresh process. Using a logging.Handler here avoids re-implementing
+    # error parsing.
+    import logging as _logging
+    _sock_err_times = []
+
+    class _SocketWatchdog(_logging.Handler):
+        def emit(self, record):
+            msg = record.getMessage()
+            if "Failed to check the state of sock" not in msg:
+                return
+            now = time.time()
+            _sock_err_times.append(now)
+            # Drop entries older than 60s.
+            while _sock_err_times and now - _sock_err_times[0] > 60:
+                _sock_err_times.pop(0)
+            if len(_sock_err_times) >= 5:
+                print(f"[watchdog] {len(_sock_err_times)} socket failures in "
+                      f"60s — exiting so a supervisor can restart us.")
+                # Hard exit so any threads/sockets are torn down immediately.
+                os._exit(1)
+
+    _logging.getLogger().addHandler(_SocketWatchdog())
+
     print("Slack bridge running. DM your bot or @mention it in a channel.")
     SocketModeHandler(app, app_token).start()
 

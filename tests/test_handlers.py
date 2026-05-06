@@ -1189,6 +1189,127 @@ class UnknownCommandTests(unittest.TestCase):
         self.assertNotIn("Unknown bridge command", text)
 
 
+# ---- auto-relink: recover named sessions across bridge restarts -------------
+
+class AutoRelinkTests(unittest.TestCase):
+    """When a free-text message arrives in a channel with no in-memory
+    session, the bridge should look up the channel name and try to
+    re-attach to a still-live tmux session of the same name. Recovers
+    from bridge restarts / SSL races where the in-memory `sessions`
+    dict was wiped but the tmux pane is still alive."""
+
+    def setUp(self):
+        self.handle, self.app = fresh_handler()
+
+    def _set_channel_name(self, name):
+        # Make app.client.conversations_info return the given channel name.
+        self.app.client.conversations_info = lambda **kw: {
+            "channel": {"id": kw["channel"], "name": name}
+        }
+
+    def test_relink_named_session_when_tmux_alive(self):
+        self._set_channel_name("gemini-foo-1234")
+        # No session in dict, but tmux session with the right name exists.
+        with mock.patch.object(bridge, "session_exists", return_value=True), \
+             mock.patch.object(bridge, "send_and_wait", return_value="hi from agent"):
+            self.handle("U", "C123", "free-text message", None)
+        # Session should now be in the dict.
+        with bridge.sessions_lock:
+            sess = bridge.sessions.get("C123")
+        self.assertIsNotNone(sess, "auto-relink should have created a CLISession")
+        self.assertEqual(sess.cli, "gemini")
+        self.assertEqual(sess.tmux_name, "gemini-foo-1234")
+        self.assertTrue(sess.is_named)
+
+    def test_relink_skips_unrecognized_pattern(self):
+        self._set_channel_name("random-channel")
+        with mock.patch.object(bridge, "session_exists", return_value=True):
+            self.handle("U", "C123", "free-text message", None)
+        with bridge.sessions_lock:
+            self.assertNotIn("C123", bridge.sessions)
+        self.assertIn("No active session", last_post_text(self.app))
+
+    def test_relink_skips_when_tmux_gone(self):
+        self._set_channel_name("gemini-foo-1234")
+        # Channel name matches but tmux session doesn't exist anymore.
+        with mock.patch.object(bridge, "session_exists", return_value=False):
+            self.handle("U", "C123", "free-text", None)
+        with bridge.sessions_lock:
+            self.assertNotIn("C123", bridge.sessions)
+        self.assertIn("No active session", last_post_text(self.app))
+
+    def test_relink_handles_conversations_info_error(self):
+        # Slack call fails for some reason — no recovery, fallthrough to
+        # the existing "no session" message.
+        def boom(**kw):
+            raise RuntimeError("conversations.info exploded")
+        self.app.client.conversations_info = boom
+        with mock.patch.object(bridge, "session_exists", return_value=True):
+            self.handle("U", "C123", "free-text", None)
+        with bridge.sessions_lock:
+            self.assertNotIn("C123", bridge.sessions)
+        self.assertIn("No active session", last_post_text(self.app))
+
+    def test_existing_session_skips_relink(self):
+        # If sessions[channel] is already set, relink shouldn't even be tried.
+        seed_session(channel="C123", cli="claude")
+        looked_up = []
+        self.app.client.conversations_info = lambda **kw: looked_up.append(kw) or {
+            "channel": {"id": kw["channel"], "name": "irrelevant"}
+        }
+        with mock.patch.object(bridge, "send_and_wait", return_value="ok"):
+            self.handle("U", "C123", "hello", None)
+        self.assertEqual(looked_up, [], "should not call conversations_info "
+                         "when session already exists")
+
+
+class DebugCommandTests(unittest.TestCase):
+    """`!debug` dumps internal state — pid, uptime, sessions, orphan tmux."""
+
+    def setUp(self):
+        self.handle, self.app = fresh_handler()
+
+    def test_dumps_empty_state(self):
+        with mock.patch.object(bridge.subprocess, "check_output",
+                               return_value=""):
+            self.handle("U", "D1", "!debug", None)
+        text = last_post_text(self.app)
+        self.assertIn("Bridge debug", text)
+        self.assertIn("pid", text)
+        self.assertIn("In-memory sessions:* none", text)
+
+    def test_dumps_seeded_sessions(self):
+        seed_session(channel="C0001", cli="gemini",
+                     tmux_name="gemini-proj-abcd")
+        seed_session(channel="C0002", cli="codex",
+                     tmux_name="codex-other-1234")
+        with mock.patch.object(bridge.subprocess, "check_output",
+                               return_value="gemini-proj-abcd\ncodex-other-1234"):
+            self.handle("U", "D1", "!debug", None)
+        text = last_post_text(self.app)
+        self.assertIn("In-memory sessions (2):", text)
+        self.assertIn("gemini-proj-abcd", text)
+        self.assertIn("codex-other-1234", text)
+        # Both tmux sessions are tracked, so no orphans.
+        self.assertNotIn("Orphan", text)
+
+    def test_lists_orphan_tmux_sessions(self):
+        seed_session(channel="C0001", cli="gemini",
+                     tmux_name="gemini-tracked-1111")
+        # tmux ls returns the tracked one + an orphan that's not in `sessions`.
+        with mock.patch.object(bridge.subprocess, "check_output",
+                               return_value="gemini-tracked-1111\n"
+                                            "gemini-orphan-2222\n"
+                                            "some-random-name"):
+            self.handle("U", "D1", "!debug", None)
+        text = last_post_text(self.app)
+        self.assertIn("Orphan agent-pattern tmux sessions", text)
+        self.assertIn("gemini-orphan-2222", text)
+        # Random name doesn't match the agent-channel regex → not listed
+        # under orphans.
+        self.assertNotIn("some-random-name", text)
+
+
 # ---- safety: codex must use -a untrusted ------------------------------------
 
 class CodexSafetyConfigTests(unittest.TestCase):

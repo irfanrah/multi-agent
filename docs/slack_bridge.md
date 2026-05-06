@@ -75,6 +75,7 @@ Recognized at the start of a message:
 | `!status` | Show what's running in this channel. |
 | `!sessions` / `!ls` / `!list` | Snapshot every active session globally (channel link, cli, idle, tmux name, cwd, extra_args). |
 | `!raw [N]` / `!pane` / `!tail` | Last N lines of the cleaned tmux pane (default 60, max 500). Same `clean_output` ANSI/box/spinner stripping as the regular reply path, but **no chrome clipping** — so it shows what `send_and_wait` would have eaten. Use when a streaming/monitor command's reply came back as `(no output)`. |
+| `!debug` | Dump the bridge's internal state: pid, uptime, in-memory sessions dict, and any orphan tmux sessions matching the agent-channel pattern (`<cli>-<slug>-<uniqid>`) but not currently tracked. Use when sessions appear lost or behavior is unexplained. |
 | `!check_limit` / `!limits` / `!check` | Run the `check_limit` parsers in parallel (with a sequential retry for any CLI that came back short) and post a Block Kit summary. |
 | `!upload <path>` | Upload file(s)/folder(s). Single-path form prompts you to pick: `1` (Slack direct — zips folders, no password, 1 GB cap, junk excluded) or `2` (pixeldrain — encrypted zip with password `!2345678`, public link ~60 days from last view, no Slack size cap). Skip the prompt with `!upload --direct <path>` or `!upload --link <path>`. Multi-path / glob always goes direct. Junk excluded: `.git`/`__pycache__`/`node_modules`/`.venv`/`venv`/`.tox`/`.mypy_cache`/`.pytest_cache`/`*.pyc`/`*.pyo`/`.DS_Store`. |
 | `1` / `!1` / `2` / `!2` | Pick the option for the most recent `!upload` in this channel (within 2 min). Plain `1`/`2` falls through to the active CLI session if there's no pending menu — so codex/claude permission dialogs still work. |
@@ -176,6 +177,39 @@ From the docstring at the top of `main.py`:
 | `chat:write.customize` *(optional)* | Branded "CLI Bridge — Gemini" identity in named channels |
 
 Subscribe the bot to `app_mention`, `message.im`, `message.groups`.
+
+## Recovery from bridge state loss
+
+The bridge keeps `sessions` in process memory only — a restart wipes the
+dict, even though the underlying `tmux` sessions usually survive. Two
+mechanisms handle that gap:
+
+1. **Auto-relink (silent).** When a free-text message arrives in a channel
+   with no `sessions[channel]` entry, `try_relink_session(channel, app)`
+   does:
+   - `conversations.info(channel)` to fetch the channel name.
+   - Match against `^(gemini|codex|claude)-.+-[0-9a-f]{4}$`
+     (`NAMED_CHANNEL_RE`).
+   - If matched, `session_exists(name)` checks for a live tmux pane.
+   - If yes, build a new `CLISession(cli=…, tmux_name=name, path=None,
+     slack_channel_id=channel, is_named=True)` and insert under
+     `sessions_lock`. The handler dispatch then continues normally.
+   `path` and `extra_args` are unrecoverable (they only existed in the
+   prior bridge's memory) — that affects `!run`'s default cwd and a
+   model flag's persistence across `!reset`. Accepted tradeoff.
+2. **Socket watchdog (process-level).** `slack_bolt`'s Socket Mode
+   auto-reconnects on transient errors but has been observed to leave
+   the bridge alive-but-degraded for hours after persistent SSL drops.
+   `main()` installs a `logging.Handler` that watches for
+   `"Failed to check the state of sock"` lines; 5 of them within 60s
+   triggers `os._exit(1)` so an external supervisor (systemd /
+   `nohup` loop / tmux respawn) can bring up a fresh process. Auto-relink
+   then heals everything mid-flight as users continue messaging.
+
+When something looks off, ask the user to send `!debug` — it dumps pid,
+uptime, the in-memory sessions dict, and any orphan tmux sessions whose
+name matches the agent-channel pattern but isn't currently tracked.
+Pasting that output back is enough to diagnose most state-loss cases.
 
 ## Things that are easy to miss
 
