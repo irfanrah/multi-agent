@@ -148,6 +148,13 @@ class Driver:
                 hist = self.user.conversations_history(channel=channel, limit=30)
             except SlackApiError as e:
                 err = e.response.get("error", "?")
+                if err == "ratelimited":
+                    # Back off and retry rather than bailing — a long wait
+                    # naturally accumulates polls until Slack throttles us.
+                    retry_after = int(e.response.headers.get("Retry-After", 30))
+                    print(f"    [ratelimited; sleeping {retry_after}s]")
+                    time.sleep(retry_after)
+                    continue
                 print(f"    [history error: {err}]")
                 return None
             # API returns newest-first; oldest-first traversal lets us
@@ -172,7 +179,10 @@ class Driver:
                 if contains and contains not in msg.get("text", ""):
                     continue
                 return msg
-            time.sleep(2.0)
+            # 5s between polls keeps us well under conversations.history's
+            # tier-3 rate limit (~50/min). At 2s we hit ratelimited on the
+            # longer waits.
+            time.sleep(5.0)
         return None
 
     def find_new_channel(self, after_ts, name_prefix, timeout=30):

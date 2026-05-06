@@ -14,3 +14,7 @@ output/check_limit/*.txt
 # Per-machine Claude Code settings (permissions, hooks). Not for sharing.
 .claude/settings.local.json
 
+# tests/slack_drive_upload.py builds a temporary fixture under here.
+# The script cleans up by default; --keep-fixture leaves it behind.
+assets/test/
+
