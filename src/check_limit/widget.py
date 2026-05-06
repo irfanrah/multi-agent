@@ -57,6 +57,12 @@ def _capture_one(name, opts):
         send_keys=opts.get("send_keys"),
         prompt_ready=opts.get("prompt_ready"),
         ready_check=lambda t: len(parser(t)) >= expected,
+        # Stability gate — require two consecutive captures with the
+        # same parsed rows before returning. Without it we sometimes
+        # caught the panel mid-render (placeholder "0%" before the real
+        # numbers fill in) and the widget showed 0% in green, which is
+        # worse than an error because it looks healthy.
+        parser=parser, stable=True,
         max_wait=MAX_WAIT_SEC,
     )
     return name, parser(raw)
