@@ -689,9 +689,13 @@ class UploadMenuTests(unittest.TestCase):
                     captured["unencrypted"] = True
                 except RuntimeError:
                     captured["unencrypted"] = False
-            return "https://pixeldrain.com/u/xyz"
+            return ("pixeldrain-post", "https://pixeldrain.com/u/xyz")
 
-        with mock.patch.object(bridge, "pixeldrain_put", side_effect=fake_put), \
+        # The bridge calls `link_upload()` (the fallback-chain entry point)
+        # — not the individual host functions. Mock that boundary so we
+        # can verify the encrypted-zip is built correctly without making
+        # any real HTTP requests.
+        with mock.patch.object(bridge, "link_upload", side_effect=fake_put), \
              mock.patch.object(self.app.client, "files_upload_v2") as up:
             self.handle("U", "D1", "2", None)
         up.assert_not_called()  # Slack file-upload not used in link flow.
@@ -703,6 +707,7 @@ class UploadMenuTests(unittest.TestCase):
                          "zip must require the password to read")
         text = latest_visible_text(self.app)
         self.assertIn("pixeldrain.com/u/xyz", text)
+        self.assertIn("pixeldrain-post", text)  # host name surfaced in the post
         self.assertIn(bridge.LINK_UPLOAD_PASSWORD, text)
         with bridge.pending_uploads_lock:
             self.assertNotIn("D1", bridge.pending_uploads)
@@ -740,10 +745,12 @@ class UploadMenuTests(unittest.TestCase):
 
     def test_link_flag_skips_menu(self):
         seed_session()
-        with mock.patch.object(bridge, "pixeldrain_put",
-                               return_value="https://pixeldrain.com/u/yzw") as tput:
+        with mock.patch.object(
+                bridge, "link_upload",
+                return_value=("pixeldrain-post",
+                              "https://pixeldrain.com/u/yzw")) as up:
             self.handle("U", "D1", f"!upload --link {self.td}", None)
-        tput.assert_called_once()
+        up.assert_called_once()
         # No pending stored (we went straight to the link flow).
         with bridge.pending_uploads_lock:
             self.assertNotIn("D1", bridge.pending_uploads)
@@ -755,70 +762,126 @@ class UploadMenuTests(unittest.TestCase):
         up.assert_called_once()
 
 
-class PixeldrainPutTests(unittest.TestCase):
-    """pixeldrain_put PUTs the file body to the right URL, parses the JSON
-    response, and returns the `https://<host>/u/<id>` viewer link."""
+class LinkUploadFallbackTests(unittest.TestCase):
+    """`link_upload()` tries hosts in order from `_LINK_UPLOADERS`. Returns
+    (host_name, url) on first success; raises if every host fails."""
 
-    def test_put_method_url_and_returns_link(self):
+    def setUp(self):
+        # Make a tiny tempfile that the host-functions will try to read.
         import tempfile as _t
-        with _t.NamedTemporaryFile(suffix=".zip", delete=False) as f:
-            f.write(b"\x50\x4b\x03\x04test-zip-bytes")
-            path = f.name
-        try:
-            class FakeResp:
-                def __init__(self, body): self._body = body
-                def read(self): return self._body
-                def __enter__(self): return self
-                def __exit__(self, *a): return False
-            with mock.patch.object(bridge.urllib.request, "urlopen") as op:
-                op.return_value = FakeResp(b'{"id":"abc123","success":true}')
-                link = bridge.pixeldrain_put(path,
-                                             endpoint="https://pixeldrain.com")
-            self.assertEqual(link, "https://pixeldrain.com/u/abc123")
-            # Inspect the Request object passed to urlopen.
-            req = op.call_args.args[0]
-            self.assertEqual(req.method, "PUT")
-            self.assertTrue(req.full_url.startswith("https://pixeldrain.com/api/file/"))
-            self.assertTrue(req.full_url.endswith(os.path.basename(path)))
-            self.assertEqual(req.data[:4], b"\x50\x4b\x03\x04")
-        finally:
-            os.unlink(path)
+        self.tmp = _t.NamedTemporaryFile(suffix=".zip", delete=False)
+        self.tmp.write(b"\x50\x4b\x03\x04hello")
+        self.tmp.close()
 
-    def test_non_json_response_raises(self):
-        import tempfile as _t
-        with _t.NamedTemporaryFile(suffix=".zip", delete=False) as f:
-            f.write(b"x")
-            path = f.name
-        try:
-            class FakeResp:
-                def __init__(self, body): self._body = body
-                def read(self): return self._body
-                def __enter__(self): return self
-                def __exit__(self, *a): return False
-            with mock.patch.object(bridge.urllib.request, "urlopen") as op:
-                op.return_value = FakeResp(b"<html>503 Service Unavailable</html>")
-                with self.assertRaises(RuntimeError):
-                    bridge.pixeldrain_put(path)
-        finally:
-            os.unlink(path)
+    def tearDown(self):
+        os.unlink(self.tmp.name)
 
-    def test_json_without_id_raises(self):
-        import tempfile as _t
-        with _t.NamedTemporaryFile(suffix=".zip", delete=False) as f:
-            f.write(b"x")
-            path = f.name
-        try:
-            class FakeResp:
-                def __init__(self, body): self._body = body
-                def read(self): return self._body
-                def __enter__(self): return self
-                def __exit__(self, *a): return False
-            with mock.patch.object(bridge.urllib.request, "urlopen") as op:
-                op.return_value = FakeResp(b'{"success":false,"message":"bad"}')
-                with self.assertRaises(RuntimeError):
-                    bridge.pixeldrain_put(path)
-        finally:
-            os.unlink(path)
+    def _patch_uploaders(self, **mock_funcs):
+        """mock.patch.dict(bridge._LINK_UPLOADERS, …, clear=False)."""
+        return mock.patch.dict(bridge._LINK_UPLOADERS, mock_funcs)
+
+    def test_first_host_success_short_circuits(self):
+        calls = []
+
+        def fake_first(path, *, timeout):
+            calls.append(("first", path))
+            return "https://example.com/u/aaa"
+
+        def fake_second(path, *, timeout):
+            calls.append(("second", path))
+            return "https://example.com/u/bbb"
+
+        with mock.patch.dict(
+                bridge._LINK_UPLOADERS,
+                {"pixeldrain-post": fake_first, "catbox": fake_second},
+                clear=False):
+            with mock.patch.object(
+                    bridge, "DEFAULT_UPLOADER_ORDER",
+                    ["pixeldrain-post", "catbox"]):
+                host, url = bridge.link_upload(self.tmp.name)
+        self.assertEqual(host, "pixeldrain-post")
+        self.assertEqual(url, "https://example.com/u/aaa")
+        self.assertEqual(calls, [("first", self.tmp.name)])  # second not called
+
+    def test_falls_through_to_next_host_on_failure(self):
+        def fake_first(path, *, timeout):
+            raise TimeoutError("pixeldrain hung")
+
+        def fake_second(path, *, timeout):
+            return "https://catbox.example/abc.zip"
+
+        with mock.patch.dict(
+                bridge._LINK_UPLOADERS,
+                {"pixeldrain-post": fake_first, "catbox": fake_second},
+                clear=False):
+            with mock.patch.object(
+                    bridge, "DEFAULT_UPLOADER_ORDER",
+                    ["pixeldrain-post", "catbox"]):
+                host, url = bridge.link_upload(self.tmp.name)
+        self.assertEqual(host, "catbox")
+        self.assertEqual(url, "https://catbox.example/abc.zip")
+
+    def test_all_hosts_fail_raises_with_aggregate(self):
+        def boom_a(path, *, timeout): raise RuntimeError("boom-a")
+        def boom_b(path, *, timeout): raise RuntimeError("boom-b")
+
+        with mock.patch.dict(
+                bridge._LINK_UPLOADERS,
+                {"pixeldrain-post": boom_a, "catbox": boom_b},
+                clear=False):
+            with mock.patch.object(
+                    bridge, "DEFAULT_UPLOADER_ORDER",
+                    ["pixeldrain-post", "catbox"]):
+                with self.assertRaises(RuntimeError) as ctx:
+                    bridge.link_upload(self.tmp.name)
+        msg = str(ctx.exception)
+        self.assertIn("boom-a", msg)
+        self.assertIn("boom-b", msg)
+
+    def test_env_var_overrides_order(self):
+        def fake_a(path, *, timeout): return "url-a"
+        def fake_b(path, *, timeout): return "url-b"
+
+        with mock.patch.dict(
+                bridge._LINK_UPLOADERS,
+                {"pixeldrain-post": fake_a, "catbox": fake_b},
+                clear=False):
+            with mock.patch.dict(os.environ, {"LINK_UPLOAD_HOSTS": "catbox"}):
+                host, url = bridge.link_upload(self.tmp.name)
+        self.assertEqual(host, "catbox")
+        self.assertEqual(url, "url-b")
+
+    def test_pixeldrain_post_parses_json_id(self):
+        """_upload_pixeldrain_post sends multipart and pulls `id` from JSON."""
+        class FakeResp:
+            def __init__(self, body): self._b = body
+            def read(self): return self._b
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        with mock.patch.object(bridge.urllib.request, "urlopen") as op:
+            op.return_value = FakeResp(b'{"id":"abc123","success":true}')
+            url = bridge._upload_pixeldrain_post(self.tmp.name, timeout=10)
+        self.assertEqual(url, "https://pixeldrain.com/u/abc123")
+        req = op.call_args.args[0]
+        self.assertEqual(req.method, "POST")
+        self.assertTrue(req.full_url.endswith("/api/file"))
+        self.assertIn("multipart/form-data", req.headers["Content-type"])
+
+    def test_catbox_returns_plain_url(self):
+        class FakeResp:
+            def __init__(self, body): self._b = body
+            def read(self): return self._b
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        with mock.patch.object(bridge.urllib.request, "urlopen") as op:
+            op.return_value = FakeResp(b"https://files.catbox.moe/abc.zip\n")
+            url = bridge._upload_catbox(self.tmp.name, timeout=10)
+        self.assertEqual(url, "https://files.catbox.moe/abc.zip")
+        req = op.call_args.args[0]
+        self.assertEqual(req.method, "POST")
+        self.assertTrue(req.full_url.endswith("/user/api.php"))
 
 
 class EncryptedZipBuilderTests(unittest.TestCase):
