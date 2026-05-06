@@ -1,40 +1,71 @@
 # multi-agent
 
-A small set of Python tools that drive AI coding CLIs (Claude Code, Gemini
-CLI, Codex CLI) through `tmux` and screen-scrape their TUIs:
-
-- **`slack_bridge`** — turns a Slack DM (or any channel) into a persistent
-  chat with one of the CLIs. Each `(user, channel)` keeps its own tmux
-  session so context persists across messages. Folder uploads, encrypted
-  link sharing via pixeldrain, automatic recovery from bridge restarts.
-- **`check_limit`** — polls each CLI's "show my quota" command and prints
-  a one-line summary or draws a Tk widget that auto-refreshes.
-- **`multi_agent_caption`** — caption every video in a CCTV dataset by
-  extracting the middle frame and prompting Gemini + Codex in parallel
-  with quota-aware fallback.
-
-Per-component deep dives in [`docs/`](./docs/):
-[overview](./docs/overview.md) ·
-[slack_bridge](./docs/slack_bridge.md) ·
-[check_limit](./docs/check_limit.md) ·
-[multi_agent_caption](./docs/multi_agent_caption.md).
-
-## What it looks like
-
-A real conversation in a bridge-managed agent channel. The bot's "ready"
-post; the user types free text; gemini answers; the user asks for a
-destructive action and the bridge surfaces gemini's permission dialog
-inline so the user can answer right there:
+> **One Slack bot, three coding agents.** Drive Claude Code, Gemini CLI,
+> and Codex CLI from anywhere with Slack — no SSH, no terminal, no
+> port-forwarding. Switch agents mid-conversation when one runs out of
+> quota.
 
 ![Slack conversation with the bridged gemini agent](images/slack-conversation-example.jpeg)
 
-`!help` lists every bridge command; `!check_limit` posts an at-a-glance
-quota panel for all three CLIs; the Tk desktop widget shows the same
-data outside Slack:
+## Why this exists
+
+If you use AI coding agents seriously, you've probably hit at least one
+of these walls:
+
+- **Codex and Gemini are terminal-only.** No remote, no mobile, no shared
+  workspace. The moment you close your laptop, your in-flight agent run
+  goes with it.
+- **Claude Code has a great Slack/web experience — but the token quota
+  burns absurdly fast.** Heavy days punch through your weekly cap by
+  Wednesday and you're stuck waiting until reset, watching Codex and
+  Gemini quotas sit unused on the same machine.
+- **No single app manages all three at once.** You end up juggling three
+  terminal windows, three quota pages, and a "switch and re-explain
+  context" workflow every time one of them taps out.
+
+`multi-agent` is a small Python bridge that fixes all three. It runs each
+CLI inside its own `tmux` session, screen-scrapes the TUI, and forwards
+input/output to and from a Slack channel. From any phone, browser, or
+laptop with Slack you can:
+
+- DM the bot and chat with `!gemini` / `!codex` / `!claude`
+- Spin up a per-project agent channel — `!codex myproj /path/to/repo`
+  creates `#codex-myproj-xxxx`, invites you, runs codex with cwd pinned
+- **Switch CLIs mid-thread when one hits a quota:** `!switch gemini` keeps
+  the cwd, the channel, and your context — just swaps the brain
+- See `Allow rm -rf? [1/2/3]`-style permission dialogs *inline* in Slack
+  and answer them with one tap (`1`, `2`, `y`, etc.)
+- Run shell commands locally without burning agent tokens (`!run git status`,
+  `!run ls`)
+- Upload folders as zips, share via pixeldrain link with a password,
+  download files attached to your Slack message into the agent's cwd
+- Watch all three quotas at a glance: `!check_limit`, or a desktop widget
+
+Restart-safe (the bridge auto-relinks to live tmux sessions on boot),
+quota-tracked, permission-gated, and no idle timeout — the agent's still
+there when you come back tomorrow.
+
+## At a glance
 
 | `!help` in Slack | `!check_limit` in Slack | Tk widget (`widget.py`) |
 | --- | --- | --- |
 | ![!help screenshot](images/slack-help.jpeg) | ![!check_limit screenshot](images/slack-check-limit.jpeg) | ![Tk widget screenshot](images/limit-check-widget.jpeg) |
+
+## What's in this repo
+
+- **[`slack_bridge`](./docs/slack_bridge.md)** — the bot. Slack DM/channel
+  ↔ tmux ↔ CLI. Per-channel sessions, folder uploads, pixeldrain links,
+  permission-dialog forwarding, auto-relink on restart.
+- **[`check_limit`](./docs/check_limit.md)** — polls each CLI's "show my
+  quota" command, parses the panel, prints a one-line summary or draws a
+  Tk widget that auto-refreshes.
+- **[`multi_agent_caption`](./docs/multi_agent_caption.md)** — example of
+  using both Gemini and Codex CLIs in parallel from a Python script:
+  caption every video in a dataset with quota-aware fallback across
+  model tiers and full resumability.
+
+Per-component deep dives in [`docs/`](./docs/) ·
+[overview](./docs/overview.md).
 
 ## Setup
 
