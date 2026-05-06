@@ -19,6 +19,23 @@ Per-component deep dives in [`docs/`](./docs/):
 [check_limit](./docs/check_limit.md) ·
 [multi_agent_caption](./docs/multi_agent_caption.md).
 
+## What it looks like
+
+A real conversation in a bridge-managed agent channel. The bot's "ready"
+post; the user types free text; gemini answers; the user asks for a
+destructive action and the bridge surfaces gemini's permission dialog
+inline so the user can answer right there:
+
+![Slack conversation with the bridged gemini agent](images/slack-conversation-example.jpeg)
+
+`!help` lists every bridge command; `!check_limit` posts an at-a-glance
+quota panel for all three CLIs; the Tk desktop widget shows the same
+data outside Slack:
+
+| `!help` in Slack | `!check_limit` in Slack | Tk widget (`widget.py`) |
+| --- | --- | --- |
+| ![!help screenshot](images/slack-help.jpeg) | ![!check_limit screenshot](images/slack-check-limit.jpeg) | ![Tk widget screenshot](images/limit-check-widget.jpeg) |
+
 ## Setup
 
 ```bash
