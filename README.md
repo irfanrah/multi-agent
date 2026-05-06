@@ -18,49 +18,105 @@ If you use AI coding agents seriously, you've probably hit at least one
 of these walls:
 
 - **Codex and Gemini are terminal-only.** No remote, no mobile, no shared
-  workspace. The moment you close your laptop, your in-flight agent run
-  goes with it.
+  workspace. Close your laptop and the in-flight agent run goes with it.
 - **Claude Code has a great mobile app — but the token quota burns
-  absurdly fast.** Heavy days punch through your weekly cap by
-  Wednesday and you're stuck waiting until reset, watching Codex and
-  Gemini quotas sit unused on the same machine.
-- **No single app manages all three at once.** You end up juggling three
-  terminal windows, three quota pages, and a "switch and re-explain
-  context" workflow every time one of them taps out.
+  absurdly fast.** Heavy days punch through the weekly cap by Wednesday
+  and you wait for reset, watching Codex and Gemini quotas sit unused on
+  the same machine.
+- **No single app manages all three at once.** You juggle three terminal
+  windows, three quota pages, and a "switch and re-explain context"
+  workflow every time one taps out.
 
-`multi-agent` is a small Python bridge that fixes all three. It runs each
-CLI inside its own `tmux` session, screen-scrapes the TUI, and forwards
-input/output to and from a Slack channel. From any phone, browser, or
-laptop with Slack you can:
-
-- DM the bot and chat with `!gemini` / `!codex` / `!claude`
-- Spin up a per-project agent channel — `!codex myproj /path/to/repo`
-  creates `#codex-myproj-xxxx`, invites you, runs codex with cwd pinned
-- **Switch CLIs mid-thread when one hits a quota:** `!switch gemini` keeps
-  the cwd, the channel, and your context — just swaps the brain
-- See `Allow rm -rf? [1/2/3]`-style permission dialogs *inline* in Slack
-  and answer them with one tap (`1`, `2`, `y`, etc.)
-- Run shell commands locally without burning agent tokens (`!run git status`,
-  `!run ls`)
-- Upload folders as zips, share via pixeldrain link with a password,
-  download files attached to your Slack message into the agent's cwd
-- Watch all three quotas at a glance: `!check_limit`, or a desktop widget
-
-Restart-safe (the bridge auto-relinks to live tmux sessions on boot),
-quota-tracked, permission-gated, and no idle timeout — the agent's still
-there when you come back tomorrow.
+`multi-agent` is a small Python bridge that fixes all three. Each CLI
+runs inside its own `tmux` session; the bridge screen-scrapes the TUI
+and forwards input/output to a Slack channel. From any phone, browser,
+or laptop with Slack you drive all three through one bot — switching
+mid-thread when one hits a quota, answering permission dialogs inline,
+sharing files both ways. Restart-safe (auto-relinks to live tmux on
+boot), permission-gated, no idle timeout.
 
 ## At a glance
 
-| `!help` in Slack | `!check_limit` in Slack | Tk widget (`widget.py`) |
+| `!help` | `!check_limit` | Tk widget |
 | --- | --- | --- |
 | ![!help screenshot](images/slack-help.jpeg) | ![!check_limit screenshot](images/slack-check-limit.jpeg) | ![Tk widget screenshot](images/limit-check-widget.jpeg) |
+
+`!upload` picker — direct to Slack or encrypted zip via public-link host:
+
+![!upload screenshot](images/slack-upload.png)
+
+## Commands
+
+Same grouping as `!help` in Slack. Every command works in a DM with the
+bot or in a bot-invited channel.
+
+**Start a session**
+
+- `!gemini` / `!codex` / `!claude` — start a session right here. Best in
+  a DM.
+- `!gemini <name> <path>` (also `!codex` / `!claude`) — create
+  `#<cli>-<name>-<uniqid>`, invite you, launch the CLI with `cwd=<path>`.
+  One channel per project.
+
+**Inside an agent channel**
+
+- Plain text → forwarded verbatim to the CLI; the agent's reply posts
+  back. No `@`-mention, no `!`.
+- Permission dialogs (`Allow rm -rf? [1/2/3]`) render inline. Reply with
+  the option number or `y` / `n` and the bridge forwards your answer.
+
+**Session control**
+
+- `!status` — what's running in this channel.
+- `!reset` — kill the CLI and relaunch with the same cli/cwd/model.
+- `!cancel` (aliases `!interrupt`, `!stop`) — send Esc to interrupt the
+  agent mid-turn.
+- `!switch <gemini|codex|claude>` — swap the CLI, keep the cwd and the
+  channel. Use when one hits a quota.
+- `!model <name>` — relaunch the active CLI with a model flag
+  (`!model opus`, `!model gpt-5`, `!model gemini-2.5-flash`).
+- `!end` — stop the session. Named channels are archived.
+
+**Files & shell**
+
+- `!run <cmd>` — run a shell command in the session's cwd (30s timeout).
+  No tokens spent — handy for `!run git status`, `!run ls`.
+- `!upload <path>` — share local file(s) or folder(s). Single-path form
+  prompts:
+  - `1` — direct to Slack (folder zipped, no password, junk like `.git`,
+    `__pycache__`, `node_modules`, `.venv`, `*.pyc` excluded).
+  - `2` — public-link host: encrypted zip with `LINK_UPLOAD_PASSWORD`,
+    tries `pixeldrain-post → catbox → 0x0` in order; first one that
+    works wins.
+
+  Skip the prompt with `!upload --direct <path>` or `!upload --link
+  <path>`. Multiple paths or globs always go direct.
+- `!download` (alias `!dl`) — attach a file to your Slack message *and*
+  include `!download`; the bridge saves the attachment into the
+  session's cwd. Useful for screenshots and PDFs.
+
+**Visibility & recovery**
+
+- `!sessions` (alias `!ls`, `!list`) — every active bridge session
+  globally.
+- `!debug` — bridge pid, uptime, in-memory sessions, and orphan tmux
+  sessions matching the agent-channel pattern. Paste this when behavior
+  looks off.
+- `!raw [N]` (aliases `!pane`, `!tail`) — last N lines (default 60, max
+  500) of the cleaned tmux pane. Use when streaming output got clipped
+  to `(no output)`.
+- `!check_limit` (aliases `!limits`, `!check`) — usage % for Claude /
+  Gemini / Codex with reset times.
+- `!kill-server` (aliases `!killserver`, `!nuke`) — `tmux kill-server`:
+  wipe ALL bridge sessions and archive their channels. Clean-slate
+  escape hatch.
+- `!help` — the in-Slack version of this list.
 
 ## What's in this repo
 
 - **[`slack_bridge`](./docs/slack_bridge.md)** — the bot. Slack DM/channel
-  ↔ tmux ↔ CLI. Per-channel sessions, folder uploads, pixeldrain links,
-  permission-dialog forwarding, auto-relink on restart.
+  ↔ tmux ↔ CLI. Per-channel sessions, folder uploads, public-link sharing
+  (encrypted zip), permission-dialog forwarding, auto-relink on restart.
 - **[`check_limit`](./docs/check_limit.md)** — polls each CLI's "show my
   quota" command, parses the panel, prints a one-line summary or draws a
   Tk widget that auto-refreshes.
@@ -149,15 +205,8 @@ pgrep -af 'slack_bridge/main\.py' | grep -v grep | awk '{print $1}' | xargs -r k
 ```
 
 Once the bridge prints `⚡️ Bolt app is running!`, open Slack: DM the bot
-or `@`-mention it in any channel. Send `!help` for the full command
-list. Useful starting points:
-
-- `!gemini <name> <path>` — create a private agent channel and launch
-  gemini with `cwd=<path>` (also `!codex` / `!claude`)
-- `!sessions` — list every active session globally
-- `!debug` — dump bridge state when something looks off
-- `!run <shell-cmd>` — run a shell command in the session's cwd (no agent
-  involved, no tokens spent)
+or `@`-mention it in any channel and send `!help`. The full command list
+lives in [Commands](#commands) above.
 
 ### Other tools (standalone, no Slack)
 
@@ -215,10 +264,12 @@ pattern. Paste its output if behavior looks wrong.
 - Codex is launched with `-s workspace-write -a untrusted` so the model
   cannot run shell commands or write files without raising a permission
   dialog that the bridge forwards to Slack.
-- `!upload --link` uploads to **pixeldrain** as a password-protected zip;
-  anyone with the URL + password can download until pixeldrain expires
-  the file (~60 days from last view). Set `LINK_UPLOAD_PASSWORD` in
-  `.env` to your own value.
+- `!upload --link` builds a password-protected zip and posts it to a
+  public file host (default order: pixeldrain → catbox → 0x0; first one
+  that works wins). Anyone with the URL + password can download until
+  the host expires the file (catbox is permanent, pixeldrain ~60 days,
+  0x0 retention scales with size). Set `LINK_UPLOAD_PASSWORD` and
+  optionally `LINK_UPLOAD_HOSTS` in `.env`.
 - `!run` is *local* shell on the bridge host, executed directly as the
   bridge user. It does NOT go through any agent approval. Treat it like
   an interactive terminal session for whoever can DM the bot.
