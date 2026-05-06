@@ -11,6 +11,7 @@ OUTPUT_DIR = os.path.join(REPO_ROOT, "output", "check_limit")
 def capture_cli_usage(command, session_name="usage_check", send_keys=None,
                       startup_wait=10, post_wait=4, *,
                       ready_check=None, prompt_ready=None,
+                      parser=None, stable=False,
                       max_wait=40, poll=1.0, send_settle=1.5):
     """Run a command in tmux, optionally type a slash command, capture the UI, kill the session.
 
@@ -23,6 +24,15 @@ def capture_cli_usage(command, session_name="usage_check", send_keys=None,
       typing — handy for TUIs that need a moment before accepting input.
 
     Polling is more robust against slow startups (update banners, MOTDs, login checks).
+
+    Stability gate (`stable=True` + `parser` callable): once `ready_check`
+    is satisfied, require two consecutive captures whose `parser(text)`
+    output is identical before returning. CLIs paint their /usage panel
+    in stages — first the labels with empty bars (which match the
+    parser as 0% rows), then the real numbers. Without the gate the
+    widget would happily display those placeholder zeros in green.
+    On timeout in stable mode, return an error string so the caller
+    surfaces "no data" rather than misleading 0% values.
     """
     # `claude /usage` and `gemini /model` are one-shot: they print their
     # panel and exit. By default tmux destroys a session as soon as its
@@ -71,6 +81,7 @@ def capture_cli_usage(command, session_name="usage_check", send_keys=None,
         sent = (send_keys is None)
         start = time.time()
         text = ""
+        prev_rows = None  # for the stability gate
         while time.time() - start < max_wait:
             text = _capture()
             if not sent:
@@ -80,8 +91,18 @@ def capture_cli_usage(command, session_name="usage_check", send_keys=None,
                     subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"])
                     sent = True
             elif ready_check(text):
-                return text
+                if not (stable and parser is not None):
+                    return text
+                rows_now = parser(text)
+                if prev_rows is not None and rows_now == prev_rows:
+                    return text
+                prev_rows = rows_now
             time.sleep(poll)
+        # Timeout. In stability mode the latest capture may still be a
+        # half-rendered panel — refuse to return it and let the caller
+        # surface "no data" rather than ship misleading placeholder zeros.
+        if stable and parser is not None:
+            return f"Error: panel did not stabilize within {max_wait}s"
         return text
     except Exception as e:
         return f"Error: {e}"
