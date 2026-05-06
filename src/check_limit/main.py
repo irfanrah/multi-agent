@@ -24,9 +24,38 @@ def capture_cli_usage(command, session_name="usage_check", send_keys=None,
 
     Polling is more robust against slow startups (update banners, MOTDs, login checks).
     """
+    # `claude /usage` and `gemini /model` are one-shot: they print their
+    # panel and exit. By default tmux destroys a session as soon as its
+    # last command exits, so capture-pane would race against the session
+    # disappearing. Wrap the command with a long-running tail so the pane
+    # sticks around with the rendered output until our `finally` kills it.
+    keepalive = max(int(max_wait) + 30, 90)
+    wrapped = f"{command}; sleep {keepalive}"
+
+    def _capture():
+        # capture-pane prints "can't find pane: <name>" to stderr if the
+        # session vanished or hasn't materialized yet. Treat that as a
+        # transient empty read; the polling loop will retry.
+        try:
+            return subprocess.check_output(
+                ["tmux", "capture-pane", "-pt", session_name],
+                text=True, stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            return ""
+
     try:
-        subprocess.run(["tmux", "kill-session", "-t", session_name], stderr=subprocess.DEVNULL)
-        subprocess.run(["tmux", "new-session", "-d", "-s", session_name, "-x", "200", "-y", "50", command])
+        subprocess.run(["tmux", "kill-session", "-t", session_name],
+                       stderr=subprocess.DEVNULL)
+        subprocess.run(["tmux", "new-session", "-d", "-s", session_name,
+                        "-x", "200", "-y", "50", wrapped],
+                       stderr=subprocess.DEVNULL)
+        # Sanity check: if the session never came up (rare, but tmux server
+        # contention can do it), return early with a clear error rather
+        # than spinning the polling loop on a missing pane.
+        if subprocess.run(["tmux", "has-session", "-t", session_name],
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode != 0:
+            return f"Error: tmux session {session_name} failed to start"
 
         if ready_check is None:
             # Legacy fixed-time path.
@@ -36,14 +65,14 @@ def capture_cli_usage(command, session_name="usage_check", send_keys=None,
                 time.sleep(send_settle)
                 subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"])
                 time.sleep(post_wait)
-            return subprocess.check_output(["tmux", "capture-pane", "-pt", session_name], text=True)
+            return _capture()
 
         # Polling path.
         sent = (send_keys is None)
         start = time.time()
         text = ""
         while time.time() - start < max_wait:
-            text = subprocess.check_output(["tmux", "capture-pane", "-pt", session_name], text=True)
+            text = _capture()
             if not sent:
                 if prompt_ready is None or prompt_ready(text):
                     subprocess.run(["tmux", "send-keys", "-t", session_name, "-l", send_keys])
