@@ -1,7 +1,7 @@
 """Ubuntu desktop widget that visualizes AI CLI usage limits.
 
 Run: python3 src/check_limit/widget.py
-Refreshes every 60 seconds. Captures Claude / Gemini / Codex in parallel.
+Refreshes every 5 minutes. Captures Claude / Gemini / Codex in parallel.
 """
 import datetime as dt
 import os
@@ -40,15 +40,20 @@ CLIS = [
         "expected": 2,  # 5h, weekly
     }),
 ]
-REFRESH_MS = 360_000
+REFRESH_MS = 300_000
 MAX_WAIT_SEC = 45
+
+# Namespace tmux session names by widget process id so two widget
+# instances on the same machine can run side-by-side without stomping
+# each other's sessions.
+_PID_TAG = str(os.getpid())
 
 
 def _capture_one(name, opts):
     parser = opts["parser"]
     expected = opts.get("expected", 1)
     raw = capture_cli_usage(
-        opts["cmd"], f"widget_{name.lower()}",
+        opts["cmd"], f"widget_{name.lower()}_{_PID_TAG}",
         send_keys=opts.get("send_keys"),
         prompt_ready=opts.get("prompt_ready"),
         ready_check=lambda t: len(parser(t)) >= expected,
@@ -205,7 +210,7 @@ class UsageWidget(tk.Tk):
     def _on_results(self, results):
         self.render(results)
         ts = dt.datetime.now().strftime("%H:%M:%S")
-        self.status.configure(text=f"Updated {ts} · auto-refresh every 60s")
+        self.status.configure(text=f"Updated {ts} · auto-refresh every 5 min")
         self.refresh_btn.configure(state="normal", text="↻ Refresh")
         self.after(REFRESH_MS, self.refresh)
 
