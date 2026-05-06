@@ -5,7 +5,12 @@
 > port-forwarding. Switch agents mid-conversation when one runs out of
 > quota.
 
-![Slack conversation with the bridged gemini agent](images/slack-conversation-example.jpeg)
+| Desktop Slack | iPhone Slack |
+| --- | --- |
+| ![Slack conversation with the bridged gemini agent](images/slack-conversation-example.jpeg) | <img src="images/iphone-slack.jpeg" width="320" alt="Same bridge, on iPhone Slack — agent permission dialog answered with `1`"> |
+
+Same bridge, same agent, same permission dialog — answer with `1` from
+the couch.
 
 ## Why this exists
 
@@ -15,8 +20,8 @@ of these walls:
 - **Codex and Gemini are terminal-only.** No remote, no mobile, no shared
   workspace. The moment you close your laptop, your in-flight agent run
   goes with it.
-- **Claude Code has a great Slack/web experience — but the token quota
-  burns absurdly fast.** Heavy days punch through your weekly cap by
+- **Claude Code has a great mobile app — but the token quota burns
+  absurdly fast.** Heavy days punch through your weekly cap by
   Wednesday and you're stuck waiting until reset, watching Codex and
   Gemini quotas sit unused on the same machine.
 - **No single app manages all three at once.** You end up juggling three
