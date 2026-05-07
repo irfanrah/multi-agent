@@ -167,6 +167,14 @@ context on the user-token scopes if you intend to run `slack_drive`.
 
 When creating the Slack app at https://api.slack.com/apps:
 
+**Enable Socket Mode** (required — the bridge has no public Request URL).
+
+Slack app → **Socket Mode** → toggle **Enable Socket Mode** on. Slack
+will prompt you to generate an App-Level Token with the
+`connections:write` scope; that's the `xapp-…` value that goes into
+`SLACK_APP_TOKEN` in your `.env`. With Socket Mode off, the bridge
+connects but never receives events — all DMs sit silent.
+
 **Bot Token Scopes** (always needed):
 
 ```
@@ -186,7 +194,8 @@ groups:write
 ```
 
 **Event Subscriptions** (bot events): `app_mention`, `message.im`,
-`message.groups`.
+`message.groups`. (Socket Mode delivers these over the WebSocket — no
+Request URL is needed, leave that field blank.)
 
 After adding scopes, click **Reinstall to Workspace** and copy the new
 tokens to `.env`.
