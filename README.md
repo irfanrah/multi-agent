@@ -91,6 +91,10 @@ bot or in a bot-invited channel.
 
   Skip the prompt with `!upload --direct <path>` or `!upload --link
   <path>`. Multiple paths or globs always go direct.
+- `!upload_monitor <path> [count=1] [interval=30]` — re-upload a single
+  file `count` times with `interval` seconds between uploads. Built for
+  files that get rewritten in place (screenshots, log tails) where
+  `!upload` would post the snapshot once.
 - `!download` (alias `!dl`) — attach a file to your Slack message *and*
   include `!download`; the bridge saves the attachment into the
   session's cwd. Useful for screenshots and PDFs.
@@ -134,7 +138,7 @@ pip install -r requirements.txt
 cp .env.example .env
 $EDITOR .env
 
-# 3. Run the bridge (foreground for testing; nohup for daemon)
+# 3. Run the bridge (foreground for testing; scripts/run_bridge.sh for daemon)
 python3 src/slack_bridge/main.py
 ```
 
@@ -198,11 +202,21 @@ Long-running daemon. One process per Slack workspace.
 python3 src/slack_bridge/main.py
 
 # Background — typical deployment. Survives terminal exit.
-nohup python3 -u src/slack_bridge/main.py > /tmp/slack_bridge.log 2>&1 &
+# Stops any pid recorded in slack_bridge.pid, deletes the previous
+# log+pid, then relaunches under nohup with stdout+stderr redirected
+# to slack_bridge.log at the repo root.
+scripts/run_bridge.sh
 
-# Stop a running bridge:
-pgrep -af 'slack_bridge/main\.py' | grep -v grep | awk '{print $1}' | xargs -r kill
+# Tail the live log (every line is prefixed with [YYMMDD-HHMMSS]):
+tail -f slack_bridge.log
+
+# Stop the bridge:
+kill "$(cat slack_bridge.pid)"
 ```
+
+Re-running `scripts/run_bridge.sh` is idempotent — it kills any previous
+bridge it started, wipes the old log+pid, and starts a fresh one. Use it
+both for bring-up and for restart-on-config-change.
 
 Once the bridge prints `⚡️ Bolt app is running!`, open Slack: DM the bot
 or `@`-mention it in any channel and send `!help`. The full command list
@@ -216,8 +230,13 @@ The bridge isn't required for these; they run on their own.
 # One-shot quota summary across Claude / Gemini / Codex
 python3 src/check_limit/main.py
 
-# Tk desktop widget (auto-refresh every 6 min)
+# Tk desktop widget (auto-refresh every 6 min) — foreground
 python3 src/check_limit/widget.py
+
+# …or backgrounded the same way as the bridge.
+# Writes widget.pid + widget.log at the repo root and bails early if
+# $DISPLAY is unset.
+scripts/run_widget.sh
 ```
 
 ## Tests
