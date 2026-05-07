@@ -611,6 +611,140 @@ class UploadFolderTests(unittest.TestCase):
                 os.unlink(out)
 
 
+# ---- !upload_monitor --------------------------------------------------------
+
+class UploadMonitorTests(unittest.TestCase):
+    """!upload_monitor <path> [count=1] [interval=30] — repeat-upload one file.
+
+    The handler kicks off a daemon thread; here we patch `threading.Thread`
+    to run synchronously and `time.sleep` to a no-op so each test runs
+    instantly and deterministically.
+    """
+
+    def setUp(self):
+        self.handle, self.app = fresh_handler()
+        import tempfile as _t
+        self.td = _t.mkdtemp(prefix="bridge_upmon_")
+        self.fpath = os.path.join(self.td, "screen.jpg")
+        Path(self.fpath).write_bytes(b"\x89PNG\x00fake")
+
+    def tearDown(self):
+        import shutil as _s
+        _s.rmtree(self.td, ignore_errors=True)
+
+    def _run_sync_thread(self):
+        """Replace threading.Thread with one that runs the target inline."""
+
+        class SyncThread:
+            def __init__(s, target=None, args=(), kwargs=None, daemon=False):
+                s._target, s._args, s._kwargs = target, args, kwargs or {}
+
+            def start(s):
+                s._target(*s._args, **s._kwargs)
+
+        return mock.patch.object(bridge.threading, "Thread", SyncThread)
+
+    def test_usage_when_empty(self):
+        self.handle("U", "D1", "!upload_monitor", None)
+        self.assertIn("Usage: `!upload_monitor", last_post_text(self.app))
+
+    def test_non_integer_count_rejected(self):
+        with mock.patch.object(self.app.client, "files_upload_v2") as up:
+            self.handle("U", "D1", f"!upload_monitor {self.fpath} abc", None)
+        up.assert_not_called()
+        self.assertIn("must be integers", last_post_text(self.app))
+
+    def test_zero_count_rejected(self):
+        with mock.patch.object(self.app.client, "files_upload_v2") as up:
+            self.handle("U", "D1", f"!upload_monitor {self.fpath} 0", None)
+        up.assert_not_called()
+        self.assertIn("count", last_post_text(self.app))
+
+    def test_zero_interval_rejected(self):
+        with mock.patch.object(self.app.client, "files_upload_v2") as up:
+            self.handle("U", "D1", f"!upload_monitor {self.fpath} 5 0", None)
+        up.assert_not_called()
+        self.assertIn("interval", last_post_text(self.app))
+
+    def test_missing_file_rejected_before_thread(self):
+        ghost = os.path.join(self.td, "nope.jpg")
+        with mock.patch.object(self.app.client, "files_upload_v2") as up, \
+             mock.patch.object(bridge.threading, "Thread") as th:
+            self.handle("U", "D1", f"!upload_monitor {ghost} 3 1", None)
+        up.assert_not_called()
+        th.assert_not_called()  # no loop kicked off
+        self.assertIn("not found", last_post_text(self.app))
+
+    def test_default_count_is_one_upload(self):
+        with self._run_sync_thread(), \
+             mock.patch.object(bridge.time, "sleep") as sl, \
+             mock.patch.object(self.app.client, "files_upload_v2",
+                               return_value={"ok": True}) as up:
+            self.handle("U", "D1", f"!upload_monitor {self.fpath}", None)
+        self.assertEqual(up.call_count, 1)
+        sl.assert_not_called()  # no sleep when count==1
+        # First post: announcement; last post: success summary.
+        texts = [p["text"] for p in self.app.client.posts]
+        self.assertTrue(any("Monitoring" in t and "1× every 30s" in t for t in texts),
+                        f"missing announcement, got: {texts!r}")
+        self.assertIn("upload_monitor done", last_post_text(self.app))
+
+    def test_repeat_uploads_with_interval(self):
+        with self._run_sync_thread(), \
+             mock.patch.object(bridge.time, "sleep") as sl, \
+             mock.patch.object(self.app.client, "files_upload_v2",
+                               return_value={"ok": True}) as up:
+            self.handle("U", "D1", f"!upload_monitor {self.fpath} 10 30", None)
+        # 10 uploads, 9 sleeps of 30s between them (none after the last).
+        self.assertEqual(up.call_count, 10)
+        self.assertEqual(sl.call_count, 9)
+        for call in sl.call_args_list:
+            self.assertEqual(call.args, (30,))
+        self.assertIn("upload_monitor done", last_post_text(self.app))
+        self.assertIn("10/10", last_post_text(self.app))
+
+    def test_relative_path_resolved_against_session_cwd(self):
+        seed_session(path=self.td)
+        with self._run_sync_thread(), \
+             mock.patch.object(bridge.time, "sleep"), \
+             mock.patch.object(self.app.client, "files_upload_v2",
+                               return_value={"ok": True}) as up:
+            self.handle("U", "D1", "!upload_monitor screen.jpg 1", None)
+        self.assertEqual(up.call_count, 1)
+        self.assertEqual(up.call_args.kwargs["file"], self.fpath)
+
+    def test_per_iteration_failure_continues_loop(self):
+        # Simulate the file being absent on the 2nd upload only — the loop
+        # should keep going and end with a "X failed" summary, not abort.
+        from slack_sdk.errors import SlackApiError as _SAE
+
+        class FakeResp:
+            def __init__(self, err):
+                self._err = err
+
+            def get(self, k, default=None):
+                return {"error": self._err}.get(k, default)
+
+        calls = {"n": 0}
+
+        def fake_upload(**kw):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise _SAE(message="boom", response=FakeResp("upload_error"))
+            return {"ok": True}
+
+        with self._run_sync_thread(), \
+             mock.patch.object(bridge.time, "sleep"), \
+             mock.patch.object(self.app.client, "files_upload_v2",
+                               side_effect=fake_upload):
+            self.handle("U", "D1", f"!upload_monitor {self.fpath} 3 1", None)
+        # All 3 iterations attempted; final summary reports the partial failure.
+        self.assertEqual(calls["n"], 3)
+        last = last_post_text(self.app)
+        self.assertIn("upload_monitor finished", last)
+        self.assertIn("2 ok, 1 failed", last)
+
+
 # ---- !upload menu (1/2 picker) + pixeldrain link path -----------------------
 
 class UploadMenuTests(unittest.TestCase):

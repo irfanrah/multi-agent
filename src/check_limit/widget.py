@@ -7,6 +7,7 @@ import datetime as dt
 import os
 import sys
 import threading
+import time
 import tkinter as tk
 
 # Allow running the script directly from anywhere.
@@ -17,6 +18,45 @@ from main import (  # noqa: E402
     parse_gemini_rows,
     parse_codex_rows,
 )
+
+
+class _TimestampedStream:
+    """Stream wrapper that prefixes each new line with [YYMMDD-HHMMSS].
+
+    Mirrors the bridge's logger so widget output captured by
+    scripts/run_widget.sh into widget.log lines up timestamp-wise with
+    slack_bridge.log when both runners are tailing the same incident.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._at_line_start = True
+
+    def write(self, data):
+        if not data:
+            return 0
+        out = []
+        for part in data.splitlines(keepends=True):
+            if self._at_line_start:
+                out.append(time.strftime("[%y%m%d-%H%M%S] "))
+            out.append(part)
+            self._at_line_start = part.endswith(("\n", "\r"))
+        self._stream.write("".join(out))
+        return len(data)
+
+    def flush(self):
+        return self._stream.flush()
+
+    def isatty(self):
+        return getattr(self._stream, "isatty", lambda: False)()
+
+    def fileno(self):
+        return self._stream.fileno()
+
+
+def _install_timestamped_logging():
+    sys.stdout = _TimestampedStream(sys.stdout)
+    sys.stderr = _TimestampedStream(sys.stderr)
 
 # Expected minimum row counts — used to decide when polling is "done" so we
 # don't return on a partially rendered panel.
@@ -227,4 +267,5 @@ class UsageWidget(tk.Tk):
 
 
 if __name__ == "__main__":
+    _install_timestamped_logging()
     UsageWidget().mainloop()

@@ -18,3 +18,7 @@ output/check_limit/*.txt
 # The script cleans up by default; --keep-fixture leaves it behind.
 assets/test/
 
+# Runtime artifacts from scripts/run_bridge.sh and scripts/run_widget.sh.
+# Logs may contain channel ids, user ids, and forwarded message text.
+*.log
+*.pid

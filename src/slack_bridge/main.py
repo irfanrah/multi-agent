@@ -16,6 +16,7 @@ Slack commands:
   !model <name>                Relaunch the active CLI with a model flag
   !run <shell-cmd>             One-shot shell exec in the session's cwd
   !upload <path>               Upload local file(s) to Slack
+  !upload_monitor <p> [n] [s]  Upload <p> n times, s seconds apart (defaults: n=1 s=30)
   !download / !dl              Save a file attached to this message into session's cwd
   !check_limit                 Usage % for Claude, Gemini, Codex with reset times
   !kill-server / !nuke         tmux kill-server: wipe ALL bridge sessions
@@ -58,6 +59,48 @@ from typing import Optional
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.errors import SlackApiError
+
+
+class _TimestampedStream:
+    """Stream wrapper that prefixes each new line with [YYMMDD-HHMMSS].
+
+    The bridge sprays diagnostics through plain `print()`. When the
+    process is launched in the background by scripts/run_bridge.sh and
+    its stdout/stderr are tee'd into slack_bridge.log, those lines
+    arrive without timestamps and post-mortem reading the log gets
+    painful. Wrapping the underlying stream lets us keep `print()`
+    everywhere while still getting per-line timestamps in the log.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._at_line_start = True
+
+    def write(self, data):
+        if not data:
+            return 0
+        out = []
+        for part in data.splitlines(keepends=True):
+            if self._at_line_start:
+                out.append(time.strftime("[%y%m%d-%H%M%S] "))
+            out.append(part)
+            self._at_line_start = part.endswith(("\n", "\r"))
+        self._stream.write("".join(out))
+        return len(data)
+
+    def flush(self):
+        return self._stream.flush()
+
+    def isatty(self):
+        return getattr(self._stream, "isatty", lambda: False)()
+
+    def fileno(self):
+        return self._stream.fileno()
+
+
+def _install_timestamped_logging():
+    sys.stdout = _TimestampedStream(sys.stdout)
+    sys.stderr = _TimestampedStream(sys.stderr)
 
 
 def _load_dotenv():
@@ -1559,6 +1602,88 @@ def make_handler(app):
             post(channel, _format_for_slack(tail), thread_ts)
             return
 
+        if cmd == "!upload_monitor":
+            # Repeat-upload a single file on a fixed interval. Built for
+            # cases like a screenshot or log that's continuously rewritten
+            # — `!upload <file> 1` doesn't help because !upload's second
+            # token is parsed as a second path, not a count.
+            parts = text.split()[1:]
+            if not parts:
+                post(channel,
+                     "Usage: `!upload_monitor <path> [count=1] [interval=30]`. "
+                     "Uploads `<path>` `count` times with `interval` seconds "
+                     "between uploads. Path is resolved against the session's "
+                     "cwd. File only — no folders, no globs.",
+                     thread_ts)
+                return
+            path_arg = parts[0]
+            try:
+                count = int(parts[1]) if len(parts) > 1 else 1
+                interval = int(parts[2]) if len(parts) > 2 else 30
+            except ValueError:
+                post(channel,
+                     ":warning: `count` and `interval` must be integers. "
+                     "Usage: `!upload_monitor <path> [count=1] [interval=30]`.",
+                     thread_ts)
+                return
+            if count < 1:
+                post(channel, ":warning: `count` must be ≥ 1.", thread_ts)
+                return
+            if interval < 1:
+                post(channel, ":warning: `interval` (seconds) must be ≥ 1.",
+                     thread_ts)
+                return
+            with sessions_lock:
+                sess = sessions.get(channel)
+            base = sess.path if (sess and sess.path) else os.getcwd()
+            full = path_arg if os.path.isabs(path_arg) else os.path.join(base, path_arg)
+            if not os.path.isfile(full):
+                post(channel,
+                     f":warning: `{full}` not found (or not a file). "
+                     "`!upload_monitor` only handles single files.",
+                     thread_ts)
+                return
+            name = os.path.basename(full)
+            post(channel,
+                 f":outbox_tray: Monitoring `{name}` — {count}× every "
+                 f"{interval}s.",
+                 thread_ts)
+
+            def _monitor_loop(channel, full, name, count, interval, thread_ts):
+                ok_n, fail_n = 0, 0
+                last_err = ""
+                for i in range(count):
+                    uploaded, failed = _run_direct_uploads(
+                        channel, [full], thread_ts=thread_ts)
+                    if uploaded:
+                        ok_n += 1
+                    else:
+                        fail_n += 1
+                        last_err = "; ".join(failed) if failed else "unknown error"
+                        post(channel,
+                             f":warning: upload {i+1}/{count} of `{name}` "
+                             f"failed: {last_err}",
+                             thread_ts)
+                    if i + 1 < count:
+                        time.sleep(interval)
+                if fail_n == 0:
+                    post(channel,
+                         f":white_check_mark: upload_monitor done — "
+                         f"{ok_n}/{count} uploads of `{name}`.",
+                         thread_ts)
+                else:
+                    post(channel,
+                         f":warning: upload_monitor finished — "
+                         f"{ok_n} ok, {fail_n} failed (last: {last_err}).",
+                         thread_ts)
+
+            threading.Thread(
+                target=_monitor_loop,
+                args=(channel, full, name, count, interval, thread_ts),
+                daemon=True,
+            ).start()
+            return
+
         if cmd in ("!upload", "!file", "!files"):
             # Upload local file(s)/folder(s) to Slack — direct or via pixeldrain.
             # Relative paths are resolved against the active session's cwd; globs
@@ -1922,6 +2047,10 @@ def make_handler(app):
                  f"first one that works wins)\n"
                  "Skip the prompt with `!upload --direct <path>` or "
                  "`!upload --link <path>`. Multiple paths or globs always go direct.\n"
+                 "`!upload_monitor <path> [count=1] [interval=30]` — upload one "
+                 "file repeatedly (e.g. a screenshot that's being regenerated). "
+                 "Example: `!upload_monitor screen.jpg 10 30` → 10 uploads, "
+                 "30s apart.\n"
                  "`!download` (alias `!dl`) — attach a file to your message + include "
                  "`!download` to save it into the session's cwd. Useful for sharing "
                  "screenshots or PDFs with the agent.\n"
@@ -2153,4 +2282,5 @@ def main():
 
 
 if __name__ == "__main__":
+    _install_timestamped_logging()
     main()
